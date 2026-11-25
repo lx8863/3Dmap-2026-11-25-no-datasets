@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f3f5f9">
+  <meta name="description" content="本地 COLMAP 三维重建工作台。">
+  <title>COLMAP · 三维重建工作台</title>
+  <link rel="stylesheet" href="styles.css">
+  <script defer src="point-cloud.js"></script>
+  <script defer src="interactive-view.js"></script>
+  <script defer src="timeline.js"></script>
+  <script defer src="app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <span class="brand-icon" aria-hidden="true"><i></i></span>
+        <span class="brand-name">COLMAP</span>
+        <span class="brand-label">工作台</span>
+      </div>
+      <span class="connection" id="connection" data-state="pending" role="status">
+        <span class="status-dot" aria-hidden="true"></span><span id="connection-label">检查本地服务</span>
+      </span>
+    </div>
+  </header>
+
+  <main class="workspace">
+    <header class="page-heading">
+      <div>
+        <h1>三维重建工作台</h1>
+        <p>从多视角照片恢复三维结构，在本机 GPU 上训练 3D Gaussian Splatting。</p>
+      </div>
+      <nav class="mode-switch" aria-label="工作模式">
+        <button type="button" id="reconstruction-mode" data-mode="reconstruction" aria-pressed="true">COLMAP 重建</button>
+        <button type="button" id="training-mode" data-mode="training" aria-pressed="false">3DGS 训练</button>
+        <button type="button" id="timeline-mode" data-mode="timeline" aria-pressed="false">前视时间轴</button>
+      </nav>
+    </header>
+
+    <section class="card timeline" id="dataset-timeline" aria-labelledby="timeline-title" hidden>
+      <header class="timeline-heading">
+        <div>
+          <h2 id="timeline-title">前视时间轴</h2>
+          <p id="timeline-info">scene_001 · 前视原始影像</p>
+        </div>
+        <a class="tool-button timeline-model-link" href="#training-3d">查看静态 3D 街景</a>
+      </header>
+      <div class="timeline-stage" id="timeline-stage">
+        <div id="timeline-image"></div>
+        <p id="timeline-status" role="status">正在读取时间轴…</p>
+      </div>
+      <div class="timeline-controls" aria-label="时间轴播放控制">
+        <div class="timeline-transport">
+          <button type="button" class="tool-button icon-button" id="timeline-previous" aria-label="上一帧" disabled>‹</button>
+          <button type="button" class="tool-button timeline-play" id="timeline-play" aria-pressed="false" disabled>播放</button>
+          <button type="button" class="tool-button icon-button" id="timeline-next" aria-label="下一帧" disabled>›</button>
+        </div>
+        <div class="timeline-track">
+          <input type="range" id="timeline-range" min="0" max="0" value="0" aria-label="选择时间轴帧" disabled>
+          <div class="timeline-endpoints" aria-hidden="true"><span>00:00.0</span><span id="timeline-duration">00:00.0</span></div>
+        </div>
+        <output class="timeline-readout" for="timeline-range">
+          <strong id="timeline-time">00:00.0</strong>
+          <span id="timeline-frame-number">—</span>
+        </output>
+      </div>
+    </section>
+
+    <div class="workspace-grid" id="workflow-workspace">
+      <aside class="settings-column" aria-label="重建任务设置">
+        <section class="card settings" data-section="reconstruction" aria-labelledby="settings-title">
+          <div class="card-heading settings-heading">
+            <span class="section-icon settings-icon" aria-hidden="true"></span>
+            <h2 id="settings-title">重建配置</h2>
+          </div>
+          <form id="reconstruction-form">
+            <div class="field">
+              <label for="image-path">图像目录</label>
+              <div class="path-input">
+                <span class="folder-icon" aria-hidden="true"></span>
+                <input id="image-path" name="imagePath" placeholder="/data/scene/images" required spellcheck="false" autocomplete="off">
+              </div>
+            </div>
+            <div class="field">
+              <label for="workspace-path">输出工作区</label>
+              <div class="path-input">
+                <span class="folder-icon" aria-hidden="true"></span>
+                <input id="workspace-path" name="workspacePath" placeholder="/data/scene/output" required spellcheck="false" autocomplete="off">
+              </div>
+              <p class="field-note">输入本机目录的绝对路径。</p>
+            </div>
+
+            <div class="field-row">
+              <div class="field">
+                <label for="data-type">数据类型</label>
+                <select id="data-type" name="dataType">
+                  <option value="individual">独立照片</option>
+                  <option value="video">视频序列</option>
+                  <option value="internet">网络图片</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="quality">重建质量</label>
+                <select id="quality" name="quality">
+                  <option value="low">低</option>
+                  <option value="medium">中</option>
+                  <option value="high" selected>高</option>
+                  <option value="extreme">最高</option>
+                </select>
+              </div>
+            </div>
+            <div class="field">
+              <label for="mapper">建图方式</label>
+              <select id="mapper" name="mapper">
+                <option value="incremental">增量式 · Incremental</option>
+                <option value="global">全局式 · Global</option>
+                <option value="hierarchical">层次式 · Hierarchical</option>
+              </select>
+            </div>
+
+            <div class="switches">
+              <label class="switch-row">
+                <span>使用 GPU</span>
+                <input type="checkbox" name="useGpu" id="use-gpu" role="switch">
+                <span class="switch" aria-hidden="true"></span>
+              </label>
+              <label class="switch-row">
+                <span>稠密重建 <small>需要 GPU</small></span>
+                <input type="checkbox" name="dense" id="dense" role="switch">
+                <span class="switch" aria-hidden="true"></span>
+              </label>
+            </div>
+
+            <button class="primary-button" type="submit" id="run-button" formnovalidate>
+              <span class="run-icon" aria-hidden="true"></span><span id="run-label">查看重建命令</span>
+            </button>
+            <p class="form-status" id="form-status" aria-live="polite" hidden></p>
+          </form>
+        </section>
+
+        <section class="card settings" data-section="training" aria-labelledby="training-title" hidden>
+          <div class="card-heading settings-heading">
+            <span class="section-icon settings-icon" aria-hidden="true"></span>
+            <h2 id="training-title">训练配置</h2>
+          </div>
+          <form id="training-form">
+            <div class="field">
+              <label for="source-type">数据来源</label>
+              <select id="source-type" name="sourceType">
+                <option value="dataset">已准备的 3DGS 数据集</option>
+                <option value="colmap">COLMAP 稀疏重建结果</option>
+              </select>
+            </div>
+            <div class="field">
+              <div class="field-heading">
+                <label for="training-source" id="training-source-label">数据集目录</label>
+                <button class="text-button" type="button" id="use-last-reconstruction" hidden>使用最近的重建</button>
+              </div>
+              <div class="path-input">
+                <span class="folder-icon" aria-hidden="true"></span>
+                <input id="training-source" name="sourcePath" placeholder="例如 /data/scene/dataset" aria-describedby="training-source-note" required spellcheck="false" autocomplete="off">
+              </div>
+              <p class="field-note" id="training-source-note">填写 5090 主机上包含 images/ 和 sparse/0/ 的实际目录。</p>
+            </div>
+            <div class="field" id="training-image-field" hidden>
+              <label for="training-image-path">原始图像目录</label>
+              <div class="path-input">
+                <span class="folder-icon" aria-hidden="true"></span>
+                <input id="training-image-path" name="imagePath" placeholder="例如 /data/scene/images" spellcheck="false" autocomplete="off">
+              </div>
+            </div>
+            <div class="field">
+              <label for="training-model">模型输出目录</label>
+              <div class="path-input">
+                <span class="folder-icon" aria-hidden="true"></span>
+                <input id="training-model" name="modelPath" placeholder="例如 /data/scene/model" aria-describedby="training-model-note" required spellcheck="false" autocomplete="off">
+              </div>
+              <p class="field-note" id="training-model-note">填写主机上的新目录或空目录，训练时会创建所需目录。</p>
+            </div>
+            <div class="field gpu-field">
+              <label for="training-gpu">训练显卡</label>
+              <select id="training-gpu" name="gpu" required disabled>
+                <option value="">正在检测 NVIDIA GPU</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="training-iterations">训练迭代数</label>
+              <input id="training-iterations" name="iterations" type="number" min="1" step="1" value="30000" required>
+            </div>
+            <button class="primary-button" type="submit" id="train-button" disabled>
+              <span class="run-icon" aria-hidden="true"></span><span id="train-label">开始训练</span>
+            </button>
+            <p class="form-status" id="training-status" aria-live="polite" hidden></p>
+          </form>
+        </section>
+
+        <section class="card workflow" data-section="reconstruction" aria-labelledby="workflow-title">
+          <div class="card-heading workflow-heading">
+            <span class="section-icon workflow-icon" aria-hidden="true"></span>
+            <h2 id="workflow-title">处理流程</h2>
+          </div>
+          <ol class="steps" id="steps">
+            <li data-stage="extract" data-state="waiting"><span class="step-marker" aria-hidden="true"></span><span>特征提取</span><span class="step-status">等待</span></li>
+            <li data-stage="match" data-state="waiting"><span class="step-marker" aria-hidden="true"></span><span>特征匹配</span><span class="step-status">等待</span></li>
+            <li data-stage="sparse" data-state="waiting"><span class="step-marker" aria-hidden="true"></span><span>稀疏重建</span><span class="step-status">等待</span></li>
+            <li data-stage="dense" data-state="skipped"><span class="step-marker" aria-hidden="true"></span><span>稠密重建</span><span class="step-status">已关闭</span></li>
+          </ol>
+        </section>
+        <section class="card workflow" data-section="training" aria-labelledby="training-progress-title" hidden>
+          <div class="card-heading workflow-heading">
+            <span class="section-icon workflow-icon" aria-hidden="true"></span>
+            <h2 id="training-progress-title">训练进度</h2>
+            <span class="progress-status" id="training-progress-status">等待开始</span>
+          </div>
+          <progress id="training-progress" value="0" max="1" aria-label="已完成的训练迭代"></progress>
+          <p class="progress-detail" id="training-progress-detail">— / — 次迭代</p>
+          <p class="training-result" id="training-result" hidden></p>
+        </section>
+      </aside>
+
+      <div class="results-column">
+        <section class="card model-card" id="model-card" aria-labelledby="model-title">
+          <div class="card-heading model-heading">
+            <div class="model-heading-title">
+              <span class="section-icon model-icon" aria-hidden="true"></span>
+              <h2 id="model-title">点云预览</h2>
+              <span class="model-badge" id="model-badge">示例</span>
+            </div>
+            <div class="viewer-tools">
+              <div class="preview-switch" id="preview-switch" aria-label="结果显示方式" hidden>
+                <button type="button" id="preview-interactive" aria-pressed="false" hidden>自由 3D</button>
+                <button type="button" id="preview-render" aria-pressed="true">相机视角</button>
+                <button type="button" id="preview-points" aria-pressed="false">点云</button>
+              </div>
+              <button class="tool-button" type="button" id="reset-view" title="重置视角" aria-label="重置视角"><span class="reset-icon" aria-hidden="true"></span><span>重置视角</span></button>
+              <button class="tool-button icon-button" type="button" id="fullscreen" title="全屏" aria-label="全屏" aria-pressed="false"><span class="fullscreen-icon" aria-hidden="true"></span></button>
+            </div>
+          </div>
+          <div class="viewport" id="viewport">
+            <canvas id="point-cloud" aria-label="可旋转和缩放的三维点云"></canvas>
+            <div class="viewport-label" id="viewport-label"><span class="viewport-dot" aria-hidden="true"></span><span id="viewport-label-text">石柱建筑 · 示例点云</span></div>
+            <div class="viewport-hint" id="point-hint"><span class="mouse-icon" aria-hidden="true"></span>拖动旋转 <span aria-hidden="true">·</span> 滚轮缩放</div>
+            <div class="render-view" id="render-view" hidden>
+              <div class="render-frame">
+                <img id="render-image" alt="3DGS 渲染画面">
+                <p id="render-error" role="status" hidden>暂时无法读取这个视角。</p>
+              </div>
+              <div class="render-controls">
+                <button class="tool-button render-arrow" type="button" id="render-previous" aria-label="上一个相机视角">‹</button>
+                <span id="render-position" aria-live="polite"></span>
+                <button class="tool-button render-arrow" type="button" id="render-next" aria-label="下一个相机视角">›</button>
+                <button class="tool-button render-reference" type="button" id="render-reference" aria-pressed="false">对照原图</button>
+              </div>
+            </div>
+            <div class="interactive-view" id="interactive-view" tabindex="0" aria-label="自由 3D 相机，拖动环绕，按住 Shift 拖动平移，滚轮缩放" hidden>
+              <img id="interactive-image" alt="3DGS 自由视角渲染" draggable="false" hidden>
+              <p id="interactive-status" role="status" hidden></p>
+            </div>
+            <div class="camera-tools" id="camera-tools" aria-label="相机控制">
+              <div class="preview-switch" id="point-scope" aria-label="点云范围" hidden>
+                <button id="point-focus" type="button" aria-pressed="true">主体</button>
+                <button id="point-entire" type="button" aria-pressed="false">全景</button>
+              </div>
+              <button class="tool-button" id="camera-pan" type="button" aria-pressed="false" title="也可以 Shift 加拖动或用右键拖动">平移</button>
+              <button class="tool-button icon-button" id="camera-zoom-out" type="button" aria-label="拉远相机">−</button>
+              <button class="tool-button icon-button" id="camera-zoom-in" type="button" aria-label="拉近相机">+</button>
+            </div>
+            <button class="exit-fullscreen" id="exit-fullscreen" type="button">退出全屏</button>
+          </div>
+          <div class="model-details">
+            <dl class="metrics">
+              <div><dt>三维点</dt><dd id="point-count">—</dd></div>
+              <div><dt>注册图像</dt><dd id="camera-count">—</dd></div>
+            </dl>
+            <span class="model-detail-note" id="model-detail-note">示例用于预览交互</span>
+          </div>
+        </section>
+
+        <section class="card activity-card" aria-label="任务输出">
+          <div class="activity-heading">
+            <div class="tabs" role="tablist" aria-label="任务输出">
+              <button class="tab" id="logs-tab" type="button" role="tab" aria-selected="true" aria-controls="logs-panel">运行日志</button>
+              <button class="tab" id="command-tab" type="button" role="tab" aria-selected="false" aria-controls="command-panel" tabindex="-1">命令预览</button>
+            </div>
+            <button class="tool-button" type="button" id="copy-command" hidden><span class="copy-icon" aria-hidden="true"></span><span id="copy-label">复制命令</span></button>
+          </div>
+          <div class="activity-panel" id="logs-panel" role="tabpanel" aria-labelledby="logs-tab" tabindex="0">
+            <div class="empty-log" id="empty-log"><span class="terminal-icon" aria-hidden="true">›_</span><span id="empty-log-text">等待任务开始</span></div>
+            <pre id="log-output" hidden></pre>
+          </div>
+          <div class="activity-panel" id="command-panel" role="tabpanel" aria-labelledby="command-tab" tabindex="0" hidden>
+            <pre id="command-output"></pre>
+          </div>
+        </section>
+      </div>
+    </div>
+  </main>
+</body>
+</html>

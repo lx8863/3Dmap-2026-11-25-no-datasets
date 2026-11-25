@@ -1,0 +1,1 @@
+Namespace(sh_degree=3, source_path='/home/robot/code/LX/3Dmap/outputs/scene_001-front-forward-7000/training_data', model_path='/home/robot/code/LX/3Dmap/outputs/scene_001-front-forward-7000', images='images', depths='', resolution=-1, white_background=False, train_test_exp=False, data_device='cuda', eval=False)

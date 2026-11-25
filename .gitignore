@@ -1,0 +1,7 @@
+# Point clouds are intentionally excluded from this shared repository.
+*.ply
+*.pcd
+*.las
+*.laz
+*.splat
+*.spz
