@@ -4,6 +4,12 @@
 
 仓库从 2026-11-25 的归档发展而来。首页内置一个「庭院花簇」示例，模型和来源说明位于 `web/sample/`。导入照片生成的项目会保存在本机。
 
+## 显卡覆盖范围
+
+目前覆盖 **NVIDIA GTX 16 系和 RTX 20、30、40、50 系**。这个范围指 **3DGS 训练和自由视角的 CUDA 构建**。GTX 10 系及更早型号、AMD 和 Intel 显卡不在本次覆盖范围内。
+
+运行时仍需匹配的 NVIDIA 驱动、CUDA 版 PyTorch、已编译的扩展及足够显存；上述构建覆盖范围不代表每个型号均已完成实机验证。配置方法见[显卡兼容与编译说明](web/README.md#显卡兼容与编译)。
+
 ## 下载
 
 在 GitHub 仓库页面点击 **Code → Download ZIP**，下载后解压；也可以使用 Git：
@@ -20,7 +26,7 @@ cd 3Dmap-2026-11-25-no-datasets
 - `web/`：网页工作台和本地 Python 服务，使用说明见 [web/README.md](web/README.md)。
 - `colmap/`：COLMAP 源码。
 - `gaussian-splatting/gaussian-splatting/`：3D Gaussian Splatting 源码及依赖代码。
-- `outputs/`：原始归档的训练配置、相机参数和日志。
+- `outputs/`：本机生成的训练输出，不随仓库分发。
 - `packaging/`：Windows 便携版启动器和构建脚本。
 
 ## 启动工作台

@@ -64,6 +64,8 @@ web/.vggt/venv/Scripts/python.exe -m pip install "pycolmap==4.2.1" huggingface_h
 
 ## 显卡兼容与编译
 
+目前覆盖 **NVIDIA GTX 16 系和 RTX 20、30、40、50 系**。这个范围指 **3DGS 训练和自由视角的 CUDA 构建**。GTX 10 系及更早型号、AMD 和 Intel 显卡不在本次覆盖范围内。构建覆盖范围不代表每个型号均已完成实机验证。
+
 照片标定可选 CPU 版 COLMAP。3DGS 训练、自由视角和 VGGT 需要支持当前显卡的 NVIDIA 驱动与 CUDA 版 PyTorch。VGGT 在计算能力 8.0 及以上使用 BF16，在 7.5 使用 FP16。显存较小的显卡可先用 COLMAP 标定少量照片。 [NVIDIA 显卡计算能力列表](https://developer.nvidia.com/cuda/gpus)
 
 | 显卡 | CUDA 计算能力 |
