@@ -32,7 +32,10 @@ import uuid
 from dataset_timeline import timeline_image, timeline_manifest
 from interactive_process import InteractiveProcess, InteractiveRenderError
 from photo_jobs import read_upload, save_upload
-from training import detect_gpus, make_training_plan, run_training, training_progress
+from training import (
+    cuda_environment, detect_gpus, make_training_plan, run_training, select_gpu,
+    training_probe_command, training_progress,
+)
 from vggt_reconstruction import VGGT_CACHE, VGGT_REVISION, validate_inputs as validate_vggt_inputs
 
 
@@ -705,14 +708,13 @@ class Workbench:
         job = Job("reconstruction", workspace, engine="vggt")
         self.start_job(job, self.run_vggt, command, env)
 
-    def vggt_command(self, images, workspace):
+    def vggt_command(self, images, workspace, gpu=None):
         command = [
             self.vggt_python, "-B", "-u", str(WEB_ROOT / "vggt_reconstruction.py"),
             "--vggt-root", str(self.vggt_root), "--weights", str(self.vggt_weights),
             "--images", str(images), "--output", str(workspace),
         ]
-        env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
-        return command, env
+        return command, cuda_environment(gpu if gpu is not None else select_gpu(self.gpus))
 
     def start_photo_job(self, stream, upload):
         self.photo_jobs_root.mkdir(parents=True, exist_ok=True)
@@ -727,19 +729,24 @@ class Workbench:
 
     def run_photo_job(self, job, workspace, total):
         images, dataset = workspace / "images", workspace / "dataset"
+        gpu = select_gpu(self.gpus)
+        self.execute(
+            job, training_probe_command(self.gs_python, self.gs_root), stage="prepare",
+            cwd=self.gs_root, env=cuda_environment(gpu),
+        )
         if job.engine == "vggt":
-            command, env = self.vggt_command(images, dataset)
+            command, env = self.vggt_command(images, dataset, gpu)
         else:
             command = [self.colmap_python, "-B", "-u", str(WEB_ROOT / "photo_jobs.py"), str(images), str(dataset)]
             env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
         self.execute(job, command, stage="calibrate", env=env)
         plan = make_training_plan(
             {"sourceType": "dataset", "sourcePath": str(dataset), "modelPath": str(job.output_path),
-             "iterations": total},
+             "iterations": total, "gpu": gpu["uuid"]},
             gs_python=self.gs_python, gs_root=self.gs_root, colmap=self.executable, gpus=self.gpus,
         )
         plan.command.extend(["--data_device", "cpu"])
-        self.run_training(job, plan)
+        self.run_training(job, plan, probe=False)
         marker = workspace / ".result.json"
         marker.write_text(json.dumps({"engine": job.engine}), encoding="utf-8")
         marker.replace(workspace / "result.json")
@@ -769,9 +776,7 @@ class Workbench:
     def read_saved_training(self, output_path, engine=None):
         total, final_model = latest_training_model(output_path)
         job = Job("training", output_path, total=total, engine=engine)
-        gpu = next((card for card in self.gpus if "RTX 5090" in card["name"].upper()), None)
-        if gpu is None and self.gpus:
-            gpu = self.gpus[0]
+        gpu = select_gpu(self.gpus) if self.gpus else None
         self.load_training_result(job, final_model, total, gpu=gpu, restored=True)
         self.load_training_views(job, output_path / "preview" / final_model.parent.name)
         job.state = "succeeded"
@@ -877,11 +882,11 @@ class Workbench:
                 "sourceType": "dataset",
             }
 
-    def run_training(self, job, plan):
+    def run_training(self, job, plan, *, probe=True):
         def execute_step(stage, command, cwd, env):
             self.execute(job, command, stage=stage, cwd=cwd, env=env)
 
-        run_training(plan, execute_step)
+        run_training(plan, execute_step, probe=probe)
         final_model = plan.output_path / "point_cloud" / f"iteration_{plan.total}" / "point_cloud.ply"
         if not final_model.is_file():
             raise ValueError("3DGS 未写出最终训练模型。请查看运行日志。")
@@ -945,9 +950,16 @@ class Workbench:
             target(job, *args)
         except subprocess.CalledProcessError as exc:
             error = f"进程退出码 {exc.returncode}。请查看运行日志。"
-            if job.stage == "calibrate":
-                error = next((line.split(": ", 1)[1] for line in reversed(job.logs)
-                              if line.startswith(("VGGT: ", "COLMAP: "))), error)
+            prefixes = {
+                "calibrate": ("VGGT: ", "COLMAP: "),
+                "vggt": ("VGGT: ",),
+                "prepare": ("3DGS: ",),
+            }.get(job.stage, ())
+            if prefixes:
+                error = next(
+                    (line.split(": ", 1)[1] for line in reversed(job.logs) if line.startswith(prefixes)),
+                    error,
+                )
         except Exception as exc:
             error = str(exc) or type(exc).__name__
         with self.lock:

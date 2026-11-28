@@ -2,11 +2,15 @@
 
 import argparse
 import importlib.metadata as metadata
+import json
+import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
-from tempfile import mkdtemp
+import sysconfig
+from tempfile import TemporaryDirectory
 
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
@@ -15,6 +19,8 @@ from PIL import Image, ImageDraw
 
 ROOT = Path(__file__).resolve().parent.parent
 VGGT_REVISION = "a288dd0f14786c93483e45524328726ab7b1b4ce"
+CUDA_CAPABILITIES = (75, 80, 86, 89, 120)
+CUDA_ARCH_LIST = " ".join(f"{arch // 10}.{arch % 10}" for arch in CUDA_CAPABILITIES) + "+PTX"
 RUNTIME_PACKAGES = (
     "torch", "torchvision", "numpy", "Pillow", "opencv-python-headless",
     "pycolmap", "plyfile", "tqdm", "simple-knn", "diff-gaussian-rasterization",
@@ -37,8 +43,9 @@ README = """3Dmap · Windows 便携版
 设置训练步数，点击「开始生成」。3DGS 完成后可查看渲染和下载 PLY。
 
 本包适用于 Windows x64，包含 Python、CUDA 运行依赖和 VGGT 本地权重。
-训练和自由视角的 CUDA 扩展面向 RTX 50 系列（sm_120）。实测 RTX 5060，
-使用兼容 CUDA 13.2 的 NVIDIA 驱动。预览图片可在无 GPU 时查看。
+打包时会检查 PyTorch 和 3DGS 扩展是否覆盖计算能力 7.5、8.0、8.6、8.9 和 12.0。
+训练和自由视角需要上述 NVIDIA 显卡、兼容打包 CUDA 版本的驱动和足够的显存。
+预览图片可在无 GPU 时查看。
 
 可将整个文件夹复制到本机其他位置。工作台仅监听本机回环地址。
 生成记录与日志保存在当前用户的 %LOCALAPPDATA%\\3Dmap 下。
@@ -121,6 +128,81 @@ def runtime_contents(destination):
     return packages
 
 
+def format_architectures(architectures):
+    return ", ".join(f"{arch // 10}.{arch % 10}" for arch in architectures)
+
+
+def require_cuda_coverage(component, architectures):
+    # A native cubin can run on later minor revisions within the same major revision.
+    missing = [
+        target for target in CUDA_CAPABILITIES
+        if not any(arch // 10 == target // 10 and arch <= target for arch in architectures)
+    ]
+    if missing:
+        raise RuntimeError(f"{component} 缺少计算能力 {format_architectures(missing)} 的 CUDA 二进制代码。")
+
+
+def find_cuobjdump(explicit):
+    if explicit:
+        return shutil.which(explicit)
+    if toolkit := os.environ.get("CUDA_PATH"):
+        executable = Path(toolkit) / "bin" / "cuobjdump.exe"
+        if executable.is_file():
+            return str(executable)
+    return shutil.which("cuobjdump.exe")
+
+
+def verify_cuda_runtime(runtime, cuobjdump):
+    # Read the compiled list even on build hosts without a visible CUDA device.
+    probe = """
+import json
+import torch
+
+if not torch.version.cuda:
+    raise SystemExit("便携版需要支持目标显卡的 CUDA 版 PyTorch。")
+
+import torchvision
+import pycolmap
+from diff_gaussian_rasterization import _C as rasterizer
+from simple_knn import _C as knn
+
+get_flags = getattr(torch._C, "_cuda_getArchFlags", None)
+architectures = get_flags() if get_flags else None
+if not architectures:
+    raise SystemExit("无法读取当前 PyTorch 编译的 CUDA 架构列表。")
+print(json.dumps({"cuda": torch.version.cuda, "architectures": architectures,
+                  "extensions": {"simple-knn": knn.__file__,
+                                 "diff-gaussian-rasterization": rasterizer.__file__}}))
+"""
+    result = subprocess.run(
+        [str(runtime / "python.exe"), "-B", "-X", "utf8", "-c", probe],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
+    )
+    if result.returncode:
+        raise RuntimeError(f"打包后的 Python 无法加载 CUDA 或重建依赖。\n{result.stderr.strip()}")
+    info = json.loads(result.stdout)
+    torch_arches = {int(arch) for arch in re.findall(r"\bsm_(\d+)\b", info["architectures"])}
+    require_cuda_coverage("PyTorch", torch_arches)
+    for component, binary in info["extensions"].items():
+        path = Path(binary).resolve()
+        if not path.is_relative_to(runtime) or path.suffix.lower() != ".pyd":
+            raise RuntimeError(f"{component} 未从便携版加载 Windows 扩展：{path}")
+        result = subprocess.run(
+            [cuobjdump, "--list-elf", str(path)],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
+        )
+        if result.returncode:
+            raise RuntimeError(f"无法检查 {component} 的 CUDA 二进制代码。\n{result.stderr.strip()}")
+        arches = {int(arch) for arch in re.findall(r"\.sm_(\d+)\.cubin\b", result.stdout)}
+        try:
+            require_cuda_coverage(component, arches)
+        except RuntimeError as error:
+            raise RuntimeError(f"{error} 请设置 TORCH_CUDA_ARCH_LIST='{CUDA_ARCH_LIST}' 后重新编译。") from error
+    print(f"Bundled CUDA {info['cuda']} supports compute capabilities {format_architectures(CUDA_CAPABILITIES)}",
+          flush=True)
+    return info["cuda"]
+
+
 def copy_studio(destination):
     web = ROOT / "web"
     for name in WEB_FILES:
@@ -189,32 +271,44 @@ def build_launcher(destination):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=ROOT / "dist" / "3Dmap-Windows-x64")
-    target = parser.parse_args().output.resolve()
+    parser.add_argument("--cuobjdump", help="Path to CUDA Toolkit's cuobjdump.exe (default: CUDA_PATH or PATH)")
+    args = parser.parse_args()
+    if sysconfig.get_platform() != "win-amd64":
+        parser.error("Build the Windows x64 portable edition with x64 Python on Windows.")
+    cuobjdump = find_cuobjdump(args.cuobjdump)
+    if cuobjdump is None:
+        parser.error("Cannot find CUDA Toolkit's cuobjdump.exe. Set CUDA_PATH or pass --cuobjdump.")
+    target = args.output.resolve()
     if target.exists():
         raise FileExistsError(f"Output already exists: {target}")
     target.parent.mkdir(parents=True, exist_ok=True)
-    staging = Path(mkdtemp(prefix=".3Dmap-build-", dir=target.parent)).resolve()
-    if staging.parent != target.parent:
-        raise RuntimeError("Unexpected staging location")
-
-    print(f"Building in {staging}", flush=True)
-    build_launcher(staging)
-    packages = runtime_contents(staging / "runtime")
-    weights, destination = copy_studio(staging)
-    save_vggt_weights(weights, destination)
-    (staging / "Start here.txt").write_text(README, encoding="utf-8-sig")
-    (staging / "Licenses").mkdir(exist_ok=True)
-    (staging / "Licenses" / "Runtime components.txt").write_text(
-        "\n".join(f"{name} {distribution.version}" for name, distribution in sorted(packages.items())) + "\n",
-        encoding="utf-8",
-    )
-    (staging / "Licenses" / "VGGT weights.txt").write_text(
-        "Derived from the official Meta VGGT-1B model.\nhttps://huggingface.co/facebook/VGGT-1B\n"
-        "CC BY-NC 4.0: https://creativecommons.org/licenses/by-nc/4.0/\n"
-        "This package removes the unused heads and stores aggregator weights in BF16.\n",
-        encoding="utf-8",
-    )
-    staging.rename(target)
+    with TemporaryDirectory(prefix=".3Dmap-build-", dir=target.parent) as temporary:
+        staging = Path(temporary)
+        print(f"Building in {staging}", flush=True)
+        build_launcher(staging)
+        runtime = staging / "runtime"
+        packages = runtime_contents(runtime)
+        try:
+            cuda_version = verify_cuda_runtime(runtime, cuobjdump)
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+            parser.exit(1, f"CUDA runtime validation failed: {error}\n")
+        weights, destination = copy_studio(staging)
+        save_vggt_weights(weights, destination)
+        (staging / "Start here.txt").write_text(README, encoding="utf-8-sig")
+        (staging / "Licenses").mkdir(exist_ok=True)
+        (staging / "Licenses" / "Runtime components.txt").write_text(
+            f"CUDA (PyTorch): {cuda_version}\n"
+            f"CUDA compute capabilities: {format_architectures(CUDA_CAPABILITIES)}\n"
+            + "\n".join(f"{name} {distribution.version}" for name, distribution in sorted(packages.items())) + "\n",
+            encoding="utf-8",
+        )
+        (staging / "Licenses" / "VGGT weights.txt").write_text(
+            "Derived from the official Meta VGGT-1B model.\nhttps://huggingface.co/facebook/VGGT-1B\n"
+            "CC BY-NC 4.0: https://creativecommons.org/licenses/by-nc/4.0/\n"
+            "This package removes the unused heads and stores aggregator weights in BF16.\n",
+            encoding="utf-8",
+        )
+        staging.rename(target)
     size = sum(item.stat().st_size for item in target.rglob("*") if item.is_file())
     print(f"Portable edition ready: {target} ({size / 1024**3:.2f} GiB)", flush=True)
 

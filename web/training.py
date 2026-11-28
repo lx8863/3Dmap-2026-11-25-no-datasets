@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+from types import SimpleNamespace
 
 
 PROGRESS_PATTERN = re.compile(r"Training progress:[^\r\n]*?\|\s*(\d+)\s*/\s*\d+")
@@ -15,35 +16,62 @@ SAVING_PATTERN = re.compile(r"\[ITER (\d+)\] Saving Gaussians")
 
 
 def detect_gpus():
-    try:
-        result = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=index,name,uuid,memory.total",
-                "--format=csv,noheader,nounits",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (OSError, subprocess.SubprocessError):
+    fields = "index,name,uuid,memory.total"
+    for query in (f"{fields},compute_cap", fields):
+        try:
+            result = subprocess.run(
+                ["nvidia-smi", f"--query-gpu={query}", "--format=csv,noheader,nounits"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except subprocess.CalledProcessError:
+            # Older versions of nvidia-smi may not expose compute_cap.
+            continue
+        except (OSError, subprocess.TimeoutExpired):
+            return []
+        break
+    else:
         return []
 
     gpus = []
     for row in csv.reader(result.stdout.splitlines(), skipinitialspace=True):
-        if len(row) != 4:
+        if len(row) not in (4, 5):
             continue
-        index, name, uuid, memory = (value.strip() for value in row)
+        index, name, uuid, memory, *capabilities = (value.strip() for value in row)
         if not index.isdecimal() or not uuid.startswith("GPU-"):
             continue
+        capability = capabilities[0] if capabilities else ""
         gpus.append({
             "index": int(index),
             "name": name,
             "uuid": uuid,
             "memoryMiB": int(memory) if memory.isdecimal() else None,
+            "computeCapability": capability if re.fullmatch(r"[0-9]+\.[0-9]+", capability) else None,
         })
     return sorted(gpus, key=lambda gpu: gpu["index"])
+
+
+def select_gpu(gpus, requested_gpu=None):
+    if requested_gpu in (None, "", "auto"):
+        return max(gpus, key=lambda card: card["memoryMiB"] or 0, default=None)
+    return next((card for card in gpus if str(requested_gpu) in (str(card["index"]), card["uuid"])), None)
+
+
+def cuda_environment(gpu):
+    return {
+        **os.environ,
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "CUDA_VISIBLE_DEVICES": gpu["uuid"],
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONIOENCODING": "utf-8",
+    }
+
+
+def training_probe_command(gs_python, gs_root):
+    return [gs_python, "-u", str(Path(__file__).resolve()), "--probe", str(gs_root)]
 
 
 def training_progress(line):
@@ -113,22 +141,9 @@ def make_training_plan(payload, *, gs_python, gs_root, colmap, gpus):
         raise ValueError("训练迭代次数必须是正整数。")
     if not gpus:
         raise ValueError("未检测到可用于 3DGS 训练的 NVIDIA GPU。")
-    requested_gpu = payload.get("gpu")
-    if requested_gpu in (None, "", "auto"):
-        gpu = next((card for card in gpus if "RTX 5090" in card["name"].upper()), gpus[0])
-    else:
-        gpu = next((card for card in gpus if str(requested_gpu) in (str(card["index"]), card["uuid"])), None)
-        if gpu is None:
-            raise ValueError("所选 NVIDIA GPU 不可用。")
-
-    environment = dict(os.environ)
-    environment.update({
-        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
-        "CUDA_VISIBLE_DEVICES": gpu["uuid"],
-        "PYTHONUNBUFFERED": "1",
-        "PYTHONDONTWRITEBYTECODE": "1",
-    })
-    probe_command = [gs_python, "-u", str(Path(__file__).resolve()), "--probe", str(root)]
+    gpu = select_gpu(gpus, payload.get("gpu"))
+    if gpu is None:
+        raise ValueError("所选 NVIDIA GPU 不可用。")
 
     dataset = source
     undistort_command = None
@@ -174,16 +189,17 @@ def make_training_plan(payload, *, gs_python, gs_root, colmap, gpus):
         total=total,
         gpu=gpu,
         root=root,
-        environment=environment,
+        environment=cuda_environment(gpu),
         dataset=dataset,
-        probe_command=probe_command,
+        probe_command=training_probe_command(gs_python, root),
         command=command,
         undistort_command=undistort_command,
     )
 
 
-def run_training(plan, execute):
-    execute("prepare", plan.probe_command, plan.root, plan.environment)
+def run_training(plan, execute, *, probe=True):
+    if probe:
+        execute("prepare", plan.probe_command, plan.root, plan.environment)
     plan.output_path.mkdir(parents=True, exist_ok=True)
     check_output_directory(plan.output_path)
     if plan.undistort_command:
@@ -207,43 +223,78 @@ def probe_training_environment(root):
     sys.path.insert(0, root)
     try:
         import torch
-    except ImportError as exc:
-        raise RuntimeError(f"训练 Python 缺少 PyTorch：{exc}") from exc
+    except (ImportError, OSError, RuntimeError) as exc:
+        raise RuntimeError(f"无法加载 PyTorch：{exc}。请安装支持本机 GPU 的 CUDA 版 PyTorch。") from exc
 
+    if torch.version.cuda is None:
+        raise RuntimeError(f"当前 PyTorch {torch.__version__} 未包含 CUDA 支持。请安装 CUDA 版 PyTorch。")
     if not torch.cuda.is_available():
-        raise RuntimeError("当前 PyTorch 无法使用所选 NVIDIA GPU。请检查训练 Python 的 CUDA 版 PyTorch 和驱动。")
+        raise RuntimeError(f"当前 PyTorch（CUDA {torch.version.cuda}）无法访问所选 NVIDIA GPU。"
+                           "请确认显卡可见，且 NVIDIA 驱动支持这一 CUDA 版本。")
 
     device = torch.device("cuda:0")
-    name = torch.cuda.get_device_name(device)
-    major, minor = torch.cuda.get_device_capability(device)
-    print(f"训练 GPU：{name}（sm_{major}{minor}），PyTorch {torch.__version__}，CUDA {torch.version.cuda}。")
     try:
-        importlib.import_module("train")
-        from diff_gaussian_rasterization import _C as rasterizer
-        from simple_knn._C import distCUDA2
-    except (ImportError, OSError) as exc:
-        raise RuntimeError(f"3DGS 依赖加载失败：{exc}。请检查训练环境中的 Python 包和 CUDA 扩展。") from exc
+        name = torch.cuda.get_device_name(device)
+        major, minor = torch.cuda.get_device_capability(device)
+    except RuntimeError as exc:
+        raise RuntimeError(f"无法初始化所选 NVIDIA GPU：{exc}。请检查 NVIDIA 驱动和所选显卡。") from exc
+    architecture = f"sm_{major}{minor}"
+    arch_list = ", ".join(torch.cuda.get_arch_list()) or "未报告"
+    print(f"训练 GPU：{name}（{architecture}），PyTorch {torch.__version__}，CUDA {torch.version.cuda}。")
+    print(f"PyTorch 编译目标：{arch_list}。")
 
     try:
-        positions = torch.tensor(
-            [[0.0, 0.0, 1.0], [0.1, 0.0, 1.1], [0.0, 0.1, 1.2], [-0.1, 0.0, 1.3]],
-            device=device,
-        )
-        identity = torch.eye(4, device=device)
-        distCUDA2(positions)
-        rasterizer.mark_visible(positions, identity, identity)
+        trainer = importlib.import_module("train")
+        import numpy as np
+        from gaussian_renderer import render
+        from scene.cameras import MiniCam
+        from scene.gaussian_model import GaussianModel
+        from utils.graphics_utils import BasicPointCloud, getProjectionMatrix
+    except (ImportError, OSError, RuntimeError) as exc:
+        raise RuntimeError(f"无法加载 {architecture} 的 3DGS 依赖：{exc}。"
+                           "请检查 PyTorch、CUDA 工具链与 3DGS 扩展的版本是否匹配。") from exc
+
+    component = "PyTorch"
+    try:
+        background = torch.zeros(3, device=device)
+        camera_transform = torch.eye(4, device=device)
+        projection = getProjectionMatrix(0.01, 10.0, 1.0, 1.0).to(device).T.contiguous()
+        camera = MiniCam(16, 16, 1.0, 1.0, 0.01, 10.0, camera_transform, projection)
         torch.cuda.synchronize(device)
-    except RuntimeError as exc:
-        raise RuntimeError(
-            f"3DGS 的 PyTorch 或 CUDA 扩展无法在 sm_{major}{minor} 上执行：{exc}。"
-            "请使用支持该显卡的 PyTorch，并为此架构重新编译 CUDA 扩展。"
-        ) from exc
-    print("PyTorch、simple-knn 和 3DGS 光栅化 CUDA 检查通过。")
+
+        component = "simple-knn"
+        positions = np.array([[0.0, 0.0, 1.0], [0.1, 0.0, 1.1], [0.0, 0.1, 1.2], [-0.1, 0.0, 1.3]],
+                             dtype=np.float32)
+        point_cloud = BasicPointCloud(positions, np.ones_like(positions), np.zeros_like(positions))
+        gaussians = GaussianModel(3)
+        gaussians.create_from_pcd(point_cloud, [], 1.0)
+        torch.cuda.synchronize(device)
+
+        component = "diff-gaussian-rasterization"
+        pipe = SimpleNamespace(convert_SHs_python=False, compute_cov3D_python=False, debug=False, antialiasing=False)
+        image = render(camera, gaussians, pipe, background, separate_sh=trainer.SPARSE_ADAM_AVAILABLE)["render"]
+        image.mean().backward()
+        torch.cuda.synchronize(device)
+
+        if trainer.FUSED_SSIM_AVAILABLE:
+            component = "fused-ssim"
+            rendered = image.detach().unsqueeze(0).requires_grad_()
+            trainer.fused_ssim(rendered, torch.zeros_like(rendered)).backward()
+            torch.cuda.synchronize(device)
+    except (OSError, RuntimeError, TypeError) as exc:
+        if component == "PyTorch":
+            hint = f"请安装支持 {architecture} 的 PyTorch，并确认 NVIDIA 驱动兼容。"
+        else:
+            hint = f"请在当前 PyTorch 和 CUDA 环境中为 {architecture} 重新编译 {component}。"
+        if component == "fused-ssim":
+            hint += "也可以移除该可选扩展以使用 PyTorch SSIM。"
+        raise RuntimeError(f"{name}（{architecture}）上的 {component} CUDA 检查失败：{exc}。{hint}") from exc
+    print("PyTorch、simple-knn 和 3DGS 光栅化前向及反向 CUDA 检查通过。")
 
 
 if __name__ == "__main__" and len(sys.argv) == 3 and sys.argv[1] == "--probe":
     try:
         probe_training_environment(sys.argv[2])
     except RuntimeError as exc:
-        print(str(exc), file=sys.stderr)
+        print(f"3DGS: {exc}", file=sys.stderr)
         sys.exit(1)

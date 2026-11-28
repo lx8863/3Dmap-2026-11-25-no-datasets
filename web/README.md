@@ -56,8 +56,32 @@ web/.vggt/venv/Scripts/python.exe -m pip install "pycolmap==4.2.1" huggingface_h
 - 产品首页的 COLMAP 通过 PyCOLMAP 运行。在同一环境安装 `pycolmap==4.2.1`、Pillow、plyfile、tqdm 和 opencv-python-headless。
 - 3DGS 环境需要可用的 CUDA PyTorch，以及为当前显卡编译的 `simple-knn` 和 `diff-gaussian-rasterization`。Windows 会优先使用 `web/.venv/Scripts/python.exe`，也可以用 `--gs-python` 指定环境。
 - 服务默认监听 `127.0.0.1`，一次运行一个任务。使用 `--lan` 时，指定的网卡和子网也可访问。
-- `serve.py` 会识别项目中已构建的 COLMAP、`web/.colmap-env/bin/colmap`、`PATH` 中的 `colmap` 和 `web/.colmap-apt/colmap`。本机后备环境使用 COLMAP 3.9.1 做 CPU 增量建图，3DGS 训练使用 RTX 5090。用 `--colmap` 可以指定其他可执行文件。
+- `serve.py` 会识别项目中已构建的 COLMAP、`web/.colmap-env/bin/colmap`、`PATH` 中的 `colmap` 和 `web/.colmap-apt/colmap`。用 `--colmap` 可以指定其他可执行文件。
 - 3DGS 默认使用 `web/.venv/bin/python`。用 `--gs-python` 可以指定其他 Python 环境，用 `--gs-root` 可以指定包含 `train.py` 的 3DGS 源码目录。
 - 重启服务时可附加 `--restore-training <模型输出目录>`，打开已保存的训练结果和渲染预览。
-- RTX 5090 训练环境需要支持 `sm_120` 的 CUDA 版 PyTorch，以及面向该架构编译的 `simple-knn` 和 `diff-gaussian-rasterization`。运行器按选中显卡的 UUID 分配 CUDA 设备，并在训练前执行 CUDA 检查。
+- 训练前会在所选显卡上执行 PyTorch、近邻计算和 3DGS 光栅化的 CUDA 检查。自动模式优先选择显存总量较大的显卡。高级工作台可指定显卡。
 - 打开高级工作台 `index.html` 可以直接操作示例点云并查看 COLMAP 命令。启动本地服务后可以运行任务和读取实际模型。
+
+## 显卡兼容与编译
+
+照片标定可选 CPU 版 COLMAP。3DGS 训练、自由视角和 VGGT 需要支持当前显卡的 NVIDIA 驱动与 CUDA 版 PyTorch。VGGT 在计算能力 8.0 及以上使用 BF16，在 7.5 使用 FP16。显存较小的显卡可先用 COLMAP 标定少量照片。 [NVIDIA 显卡计算能力列表](https://developer.nvidia.com/cuda/gpus)
+
+| 显卡 | CUDA 计算能力 |
+| --- | --- |
+| GeForce GTX 16 系、RTX 20 系 | 7.5 |
+| GeForce RTX 30 系 | 8.6 |
+| GeForce RTX 40 系 | 8.9 |
+| GeForce RTX 50 系 | 12.0 |
+
+从源码运行时，为目标显卡重编译 `simple-knn` 和 `diff-gaussian-rasterization`。构建机需要匹配 CUDA 版 PyTorch 的 CUDA Toolkit 和 C++ 编译器。为便携版覆盖上表所有显卡时，选用能编译 12.0 的 Toolkit，例如 CUDA 12.8 或 CUDA 13.x。 [PyTorch CUDA 扩展文档](https://docs.pytorch.org/docs/main/cpp_extension.html)
+
+在 Windows PowerShell 中，从仓库根目录执行以下命令。先在该 VGGT 虚拟环境准备 CUDA 版 PyTorch、torchvision 和构建依赖 `setuptools`、`wheel`、`ninja`。将 MSVC 编译器及 CUDA Toolkit 的 `bin` 目录加入构建环境。
+
+```powershell
+$env:TORCH_CUDA_ARCH_LIST = "7.5 8.0 8.6 8.9 12.0+PTX"
+web/.vggt/venv/Scripts/python.exe -m pip install --force-reinstall --no-build-isolation --no-deps --no-cache-dir `
+  ./gaussian-splatting/gaussian-splatting/submodules/simple-knn `
+  ./gaussian-splatting/gaussian-splatting/submodules/diff-gaussian-rasterization
+```
+
+便携版打包会用 CUDA Toolkit 的 `cuobjdump` 验证扩展是否包含目标 GPU 的代码。Linux 源码运行时，在相同的训练 Python 环境中编译这两个扩展，并按实际显卡设定 `TORCH_CUDA_ARCH_LIST`。如果还安装了可选的 `fused-ssim`，也要为同一架构重新编译，或在该训练环境中使用工程内置的 SSIM 回退实现。

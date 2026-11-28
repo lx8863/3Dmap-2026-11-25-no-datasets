@@ -132,7 +132,7 @@
       imagePath: $("training-image-path").value.trim(),
       modelPath: $("training-model").value.trim(),
       iterations: Number(fields.get("iterations")),
-      gpu: Number(fields.get("gpu")),
+      gpu: fields.get("gpu"),
     };
   }
 
@@ -217,10 +217,14 @@
     if (signature !== gpuOptions) {
       const previous = gpuSelect.value;
       gpuOptions = signature;
-      const options = gpus.map((gpu) => new Option(gpu.name, String(gpu.index)));
-      gpuSelect.replaceChildren(...(options.length ? options : [new Option("未检测到 NVIDIA GPU", "")]));
-      const preferred = gpus.find(({ name }) => /RTX\s+5090\b/i.test(name)) || gpus[0];
-      gpuSelect.value = gpus.some(({ index }) => String(index) === previous) ? previous : String(preferred?.index ?? "");
+      const options = gpus.map((gpu) => {
+        const architecture = gpu.computeCapability ? " · 计算能力 " + gpu.computeCapability : "";
+        return new Option(gpu.name + architecture, String(gpu.index));
+      });
+      if (options.length) options.unshift(new Option("自动选择", "auto"));
+      else options.push(new Option("未检测到 NVIDIA GPU", ""));
+      gpuSelect.replaceChildren(...options);
+      if (options.some((option) => option.value === previous)) gpuSelect.value = previous;
     }
   }
 
@@ -229,8 +233,8 @@
     $("training-source-label").textContent = isColmap ? "COLMAP 输出工作区" : "数据集目录";
     $("training-source").placeholder = isColmap ? "例如 /data/scene/output" : "例如 /data/scene/dataset";
     $("training-source-note").textContent = isColmap
-      ? "填写 5090 主机上的 COLMAP 工作区，系统会自动准备去畸变图像。"
-      : "填写 5090 主机上包含 images/ 和 sparse/0/ 的实际目录。";
+      ? "填写运行服务的电脑上的 COLMAP 工作区，系统会自动准备去畸变图像。"
+      : "填写运行服务的电脑上包含 images/ 和 sparse/0/ 的实际目录。";
     $("training-image-field").hidden = !isColmap;
     $("training-image-path").required = isColmap;
     const previous = service?.lastReconstruction;

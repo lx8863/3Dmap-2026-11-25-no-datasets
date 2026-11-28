@@ -103,7 +103,8 @@ def reconstruct(args):
     model.load_state_dict({name: weights[name] for name in model.state_dict()})
     del weights
 
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    major, _ = torch.cuda.get_device_capability()
+    dtype = torch.bfloat16 if major >= 8 else torch.float16
     model.aggregator.to(dtype=dtype)
     model.to("cuda")
     images, bounds = load_and_preprocess_images_square([str(file) for file in files], target_size=518)

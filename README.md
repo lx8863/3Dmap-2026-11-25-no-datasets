@@ -29,13 +29,13 @@ Windows 双击 `Start-3Dmap.cmd`。也可以在仓库根目录运行 `python -B 
 
 ## Windows 便携版
 
-在已按[工作台说明](web/README.md)配置 VGGT 和 3DGS 的 Windows 环境中，用 VGGT 虚拟环境运行打包脚本。
+按[显卡兼容与编译说明](web/README.md#显卡兼容与编译)配置 Windows 环境并编译多架构 CUDA 扩展，然后用同一个 VGGT 虚拟环境运行打包脚本。
 
 ```powershell
 web/.vggt/venv/Scripts/python.exe -B packaging/build_windows.py
 ```
 
-发布目录为 `dist/3Dmap-Windows-x64/`。将整个目录复制到目标电脑，然后双击 `3Dmap.exe`。预编译 CUDA 扩展面向 RTX 50 系列。运行所需的驱动及操作说明随包提供。
+发布目录为 `dist/3Dmap-Windows-x64/`。将整个目录复制到目标电脑，然后双击 `3Dmap.exe`。构建脚本会核对 PyTorch 和 3DGS 扩展的显卡架构覆盖，目标为 GTX 16 系及 RTX 20、30、40、50 系。运行所需的驱动及操作说明随包提供。
 
 ## 许可
 
