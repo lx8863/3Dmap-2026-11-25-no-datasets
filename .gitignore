@@ -1,7 +1,15 @@
-# Point clouds are intentionally excluded from this shared repository.
+# Generated point clouds stay local. The homepage ships one curated demonstration.
 *.ply
+!/web/sample/point_cloud/iteration_1000/point_cloud.ply
 *.pcd
 *.las
 *.laz
 *.splat
 *.spz
+
+# Local VGGT beta environment and model weights.
+/web/.vggt/
+/outputs/workbench/
+/dist/
+/qoder最终提交/
+/outputs/vggt-demo-02/

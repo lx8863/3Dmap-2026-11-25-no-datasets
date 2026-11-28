@@ -18,26 +18,35 @@ import re
 import secrets
 import shlex
 import shutil
+import importlib.util
 import signal
 from statistics import median
 import struct
 import subprocess
 import sys
 import threading
+from tempfile import TemporaryDirectory
 from urllib.parse import urlsplit
 import uuid
 
 from dataset_timeline import timeline_image, timeline_manifest
 from interactive_process import InteractiveProcess, InteractiveRenderError
+from photo_jobs import read_upload, save_upload
 from training import detect_gpus, make_training_plan, run_training, training_progress
+from vggt_reconstruction import VGGT_CACHE, VGGT_REVISION, validate_inputs as validate_vggt_inputs
 
 
 WEB_ROOT = Path(__file__).resolve().parent
 DEFAULT_GS_ROOT = WEB_ROOT.parent / "gaussian-splatting" / "gaussian-splatting"
+PHOTO_JOBS_ROOT = WEB_ROOT.parent / "outputs" / "workbench"
+SAMPLE_ROOT = WEB_ROOT / "sample"
 LAN_PASSWORD_FILE = Path.home() / ".config" / "colmap-workbench" / "lan-password"
 PRIVATE_LAN_RANGES = tuple(IPv4Network(cidr) for cidr in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
 FILES = {
-    "/": ("index.html", "text/html"),
+    "/": ("studio.html", "text/html"),
+    "/workbench": ("index.html", "text/html"),
+    "/studio.css": ("studio.css", "text/css"),
+    "/studio.js": ("studio.js", "text/javascript"),
     "/index.html": ("index.html", "text/html"),
     "/styles.css": ("styles.css", "text/css"),
     "/app.js": ("app.js", "text/javascript"),
@@ -508,10 +517,11 @@ def render_pose(payload):
 
 
 class Job:
-    def __init__(self, kind, output_path, dense=False, total=None):
+    def __init__(self, kind, output_path, dense=False, total=None, engine=None):
         self.id = uuid.uuid4().hex
         self.kind = kind
         self.dense = dense
+        self.engine = engine
         self.output_path = output_path
         self.state = "running"
         self.stage = None
@@ -536,6 +546,7 @@ class Job:
         return {
             "id": self.id,
             "kind": self.kind,
+            "engine": self.engine,
             "dense": self.dense,
             "outputPath": str(self.output_path),
             "state": self.state,
@@ -545,17 +556,30 @@ class Job:
             "model": model,
             "views": self.views,
             "interactive": self.interactive,
+            "downloadUrl": f"/api/jobs/{self.id}/download.ply" if self.saved_model and self.state == "succeeded" else None,
             "error": self.error,
         }
 
 
 class Workbench:
-    def __init__(self, executable, gs_python, gs_root, gpus):
+    def __init__(self, executable, gs_python, gs_root, gpus, *, vggt_python=None, vggt_root=None,
+                 vggt_weights=None, photo_jobs_root=PHOTO_JOBS_ROOT, desktop=False):
         self.executable = executable
+        self.photo_jobs_root = photo_jobs_root
+        self.desktop = desktop
         self.colmap_version, self.colmap_gpu, self.colmap_dense, self.colmap_mappers = colmap_capabilities(executable)
         self.gs_python = gs_python
         self.gs_root = gs_root
         self.gpus = gpus
+        self.vggt_python = vggt_python
+        self.vggt_root = vggt_root
+        self.vggt_weights = vggt_weights
+        self.colmap_python = next(
+            (python for python in (vggt_python, gs_python) if modules_available(python, "pycolmap")), None
+        )
+        self.gs_dependencies = modules_available(
+            gs_python, "torch", "plyfile", "tqdm", "cv2", "PIL", "simple_knn", "diff_gaussian_rasterization"
+        )
         self.job = None
         self.jobs = {"reconstruction": None, "training": None}
         self.training_result = None
@@ -565,7 +589,23 @@ class Workbench:
         self.lock = threading.Lock()
         self.renderer_lock = threading.Lock()
         self.renderer = None
+        self.renderer_job_id = None
         self.renderer_timer = None
+        self.sample = None
+
+    def photo_engine_error(self, engine):
+        if engine == "vggt":
+            return self.vggt_error()
+        if not self.colmap_python:
+            return "COLMAP 环境未就绪，请安装 PyCOLMAP。"
+        return None
+
+    def studio_training_error(self):
+        if importlib.util.find_spec("PIL") is None:
+            return "本地服务需要 Pillow 来读取照片。"
+        return self.training_error() or (
+            None if self.gs_dependencies else "3DGS 训练环境缺少 CUDA 扩展或 Python 依赖。"
+        )
 
     def training_error(self):
         if not self.gpus:
@@ -576,8 +616,20 @@ class Workbench:
             return "找不到 3DGS 的训练脚本。请检查 --gs-root。"
         return None
 
+    def vggt_error(self):
+        if not self.gpus:
+            return "VGGT 重建需要 NVIDIA GPU。"
+        if not self.vggt_python or not self.vggt_root:
+            return "VGGT 环境未就绪。请参考 web/README.md 配置测试环境。"
+        if not (self.vggt_root / "vggt" / "models" / "vggt.py").is_file():
+            return "VGGT 环境未就绪。请参考 web/README.md 配置测试环境。"
+        if not self.vggt_weights or not self.vggt_weights.is_file():
+            return "缺少 VGGT 权重 model.safetensors。请参考 web/README.md。"
+        return None
+
     def status(self):
         training_error = self.training_error()
+        vggt_error = self.vggt_error()
         with self.lock:
             jobs = {kind: job.summary() if job is not None else None for kind, job in self.jobs.items()}
             training_result = None
@@ -593,24 +645,118 @@ class Workbench:
                 "colmapDense": self.colmap_dense,
                 "colmapMappers": self.colmap_mappers,
                 "gpus": self.gpus,
+                "vggtAvailable": vggt_error is None,
+                "vggtError": vggt_error,
+                "studioTrainingError": self.studio_training_error(),
+                "studioColmapError": self.photo_engine_error("colmap"),
                 "trainingAvailable": training_error is None,
                 "trainingError": training_error,
                 "job": jobs[self.job.kind] if self.job is not None else None,
                 "jobs": jobs,
                 "trainingResult": training_result,
+                "desktop": self.desktop,
+                "sample": self.sample_preview(),
                 "lastReconstruction": self.last_reconstruction,
             }
 
+    def sample_preview(self):
+        if not self.sample or not self.sample.views:
+            return None
+        return {
+            "poster": self.sample.views[0]["url"],
+            "renderUrl": f"/api/jobs/{self.sample.id}/render" if self.sample.interactive else None,
+        }
+
+    def init_sample(self):
+        try:
+            self.sample = self.read_saved_training(SAMPLE_ROOT, "vggt")
+            self.sample.interactive = self.sample.interactive and self.gs_dependencies
+        except (OSError, ValueError, RuntimeError):
+            return
+
     def start_reconstruction(self, payload):
+        if not isinstance(payload, dict):
+            raise ValueError("任务设置格式无效。")
+        engine = payload.get("engine", "colmap")
+        if engine == "vggt":
+            self.start_vggt(payload)
+            return
+        if engine != "colmap":
+            raise ValueError("请选择有效的重建引擎。")
+        if not self.executable:
+            raise ValueError("未找到 COLMAP 可执行文件。")
         command, images, workspace, dense = reconstruction_options(payload, self.executable, self.colmap_mappers)
         if payload["useGpu"] and self.colmap_gpu is False:
             raise ValueError("当前 COLMAP 构建仅支持 CPU 特征处理。")
         if dense and self.colmap_dense is False:
             raise ValueError("当前 COLMAP 构建无法进行 GPU 稠密重建。")
-        job = Job("reconstruction", workspace, dense=dense)
+        job = Job("reconstruction", workspace, dense=dense, engine="colmap")
         if any((workspace / entry).exists() for entry in ("database.db", "sparse", "dense")):
             job.logs.append("COLMAP 会复用此工作区中的已有数据。更改图像或配置时可选择新的工作区。")
         self.start_job(job, self.run_reconstruction, command, images)
+
+    def start_vggt(self, payload):
+        if error := self.vggt_error():
+            raise ValueError(error)
+        images = directory_path(payload.get("imagePath"), "图像目录")
+        workspace = directory_path(payload.get("workspacePath"), "工作区目录")
+        validate_vggt_inputs(images, workspace)
+        command, env = self.vggt_command(images, workspace)
+        job = Job("reconstruction", workspace, engine="vggt")
+        self.start_job(job, self.run_vggt, command, env)
+
+    def vggt_command(self, images, workspace):
+        command = [
+            self.vggt_python, "-B", "-u", str(WEB_ROOT / "vggt_reconstruction.py"),
+            "--vggt-root", str(self.vggt_root), "--weights", str(self.vggt_weights),
+            "--images", str(images), "--output", str(workspace),
+        ]
+        env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+        return command, env
+
+    def start_photo_job(self, stream, upload):
+        self.photo_jobs_root.mkdir(parents=True, exist_ok=True)
+        with TemporaryDirectory(prefix=".upload-", dir=self.photo_jobs_root) as temporary:
+            staged = Path(temporary) / "job"
+            save_upload(stream, upload, staged)
+            job = Job("training", self.photo_jobs_root, total=upload.iterations, engine=upload.engine)
+            workspace = self.photo_jobs_root / job.id
+            job.output_path = workspace / "model"
+            self.start_job(job, self.run_photo_job, workspace, upload.iterations,
+                           prepare=lambda: staged.rename(workspace))
+
+    def run_photo_job(self, job, workspace, total):
+        images, dataset = workspace / "images", workspace / "dataset"
+        if job.engine == "vggt":
+            command, env = self.vggt_command(images, dataset)
+        else:
+            command = [self.colmap_python, "-B", "-u", str(WEB_ROOT / "photo_jobs.py"), str(images), str(dataset)]
+            env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+        self.execute(job, command, stage="calibrate", env=env)
+        plan = make_training_plan(
+            {"sourceType": "dataset", "sourcePath": str(dataset), "modelPath": str(job.output_path),
+             "iterations": total},
+            gs_python=self.gs_python, gs_root=self.gs_root, colmap=self.executable, gpus=self.gpus,
+        )
+        plan.command.extend(["--data_device", "cpu"])
+        self.run_training(job, plan)
+        marker = workspace / ".result.json"
+        marker.write_text(json.dumps({"engine": job.engine}), encoding="utf-8")
+        marker.replace(workspace / "result.json")
+
+    def restore_latest_photo_job(self):
+        if not self.photo_jobs_root.is_dir():
+            return
+        manifests = sorted(self.photo_jobs_root.glob("*/result.json"),
+                           key=lambda path: path.stat().st_mtime, reverse=True)
+        for manifest in manifests:
+            try:
+                engine = json.loads(manifest.read_text(encoding="utf-8"))["engine"]
+                if engine in ("vggt", "colmap"):
+                    self.restore_training(manifest.parent / "model", engine=engine)
+                    return
+            except (OSError, ValueError, RuntimeError, KeyError, TypeError):
+                continue
 
     def start_training(self, payload):
         plan = make_training_plan(
@@ -620,9 +766,9 @@ class Workbench:
         job = Job("training", plan.output_path, total=plan.total)
         self.start_job(job, self.run_training, plan)
 
-    def restore_training(self, output_path):
+    def read_saved_training(self, output_path, engine=None):
         total, final_model = latest_training_model(output_path)
-        job = Job("training", output_path, total=total)
+        job = Job("training", output_path, total=total, engine=engine)
         gpu = next((card for card in self.gpus if "RTX 5090" in card["name"].upper()), None)
         if gpu is None and self.gpus:
             gpu = self.gpus[0]
@@ -630,15 +776,21 @@ class Workbench:
         self.load_training_views(job, output_path / "preview" / final_model.parent.name)
         job.state = "succeeded"
         job.stage = "complete"
+        return job
+
+    def restore_training(self, output_path, engine=None):
+        job = self.read_saved_training(output_path, engine)
         with self.lock:
             self.job = job
             self.jobs[job.kind] = job
             self.training_result = job
 
-    def start_job(self, job, target, *args):
+    def start_job(self, job, target, *args, prepare=None):
         with self.lock:
             if self.closing or (self.job is not None and self.job.state == "running"):
                 raise RuntimeError("已有任务在运行。")
+            if prepare is not None:
+                prepare()
             self.job = job
             self.jobs[job.kind] = job
             watcher = threading.Thread(target=self.monitor, args=(job, target, args), daemon=True)
@@ -655,6 +807,7 @@ class Workbench:
                 command,
                 cwd=cwd,
                 env=env,
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -681,7 +834,7 @@ class Workbench:
                 self.process = None
 
     def update_job_progress(self, job, line):
-        if job.kind == "reconstruction":
+        if job.kind == "reconstruction" and job.engine != "vggt":
             legacy_stage = LEGACY_STAGES.get(line.strip())
             if legacy_stage:
                 job.stage = legacy_stage
@@ -710,6 +863,19 @@ class Workbench:
             }
         if job.dense and not any((job.output_path / "dense").glob("*/fused.ply")):
             raise ValueError("已生成稀疏模型。稠密点云缺失，请检查日志中的 MVS 和 GPU 信息。")
+
+    def run_vggt(self, job, command, env):
+        self.execute(job, command, stage="vggt", env=env)
+        model = load_sparse_model(job.output_path)
+        if model is None:
+            raise ValueError("VGGT 未生成可预览的点云。请查看运行日志。")
+        with self.lock:
+            job.model = model
+            self.last_reconstruction = {
+                "imagePath": str(job.output_path / "images"),
+                "workspacePath": str(job.output_path),
+                "sourceType": "dataset",
+            }
 
     def run_training(self, job, plan):
         def execute_step(stage, command, cwd, env):
@@ -779,6 +945,9 @@ class Workbench:
             target(job, *args)
         except subprocess.CalledProcessError as exc:
             error = f"进程退出码 {exc.returncode}。请查看运行日志。"
+            if job.stage == "calibrate":
+                error = next((line.split(": ", 1)[1] for line in reversed(job.logs)
+                              if line.startswith(("VGGT: ", "COLMAP: "))), error)
         except Exception as exc:
             error = str(exc) or type(exc).__name__
         with self.lock:
@@ -789,6 +958,13 @@ class Workbench:
                 if job.kind == "training":
                     self.training_result = job
 
+    def download_for(self, path):
+        with self.lock:
+            job = self.training_result
+            if job and job.saved_model and path == f"/api/jobs/{job.id}/download.ply":
+                return job.saved_model, f"3Dmap-{job.id[:8]}.ply"
+        return None
+
     def model_for(self, path):
         with self.lock:
             for job in (*self.jobs.values(), self.training_result):
@@ -798,7 +974,7 @@ class Workbench:
 
     def view_for(self, path):
         with self.lock:
-            for job in (self.jobs["training"], self.training_result):
+            for job in (self.jobs["training"], self.training_result, self.sample):
                 if job is not None and path in job.view_assets:
                     return job.view_assets[path]
         return None
@@ -807,14 +983,16 @@ class Workbench:
         pose = render_pose(payload)
         with self.renderer_lock:
             with self.lock:
-                job = self.training_result
+                job = self.sample if self.sample and self.sample.id == job_id else self.training_result
                 if job is None or job.id != job_id:
                     raise FileNotFoundError("找不到可交互渲染的训练结果。")
                 if self.closing or (self.job is not None and self.job.state == "running"):
                     raise RuntimeError("任务运行期间暂停交互渲染。")
                 if not job.interactive or not job.saved_model.is_file():
                     raise RuntimeError("此训练结果暂不可进行交互渲染。")
-            if self.renderer is not None and self.renderer.process.poll() is not None:
+            if self.renderer is not None and (
+                self.renderer_job_id != job_id or self.renderer.process.poll() is not None
+            ):
                 self.stop_renderer()
             try:
                 if self.renderer is None:
@@ -831,6 +1009,7 @@ class Workbench:
                     )
                     self.renderer = InteractiveProcess(command, self.gs_root, environment)
                     self.renderer.wait_until_ready()
+                    self.renderer_job_id = job_id
                 image = self.renderer.render(pose)
             except (InteractiveRenderError, OSError) as exc:
                 self.stop_renderer()
@@ -859,6 +1038,7 @@ class Workbench:
         if self.renderer is not None:
             process = self.renderer.process
             self.renderer = None
+            self.renderer_job_id = None
             if process.poll() is None:
                 stop_process(process)
             process.stdin.close()
@@ -875,6 +1055,17 @@ class Workbench:
 
 
 def stop_process(process):
+    if os.name == "nt":
+        for stop in (process.terminate, process.kill):
+            try:
+                stop()
+                process.wait(timeout=3)
+                return
+            except ProcessLookupError:
+                return
+            except subprocess.TimeoutExpired:
+                continue
+        return
     for signum in (signal.SIGTERM, signal.SIGKILL):
         try:
             os.killpg(process.pid, signum)
@@ -951,7 +1142,7 @@ class Handler(BaseHTTPRequestHandler):
         network = self.server.lan_network
         cross_site = self.headers.get("Sec-Fetch-Site") == "cross-site"
         navigation = (
-            self.command == "GET" and path in ("/", "/index.html")
+            self.command == "GET" and path in ("/", "/index.html", "/workbench")
             and self.headers.get("Sec-Fetch-Mode") == "navigate"
         )
         if (
@@ -995,6 +1186,10 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self.reply(HTTPStatus.OK, body, content_type)
             return
+        download = self.server.workbench.download_for(path)
+        if download is not None:
+            self.send_ply(*download)
+            return
         model = self.server.workbench.model_for(path)
         if model is not None:
             self.json(HTTPStatus.OK, model)
@@ -1014,6 +1209,28 @@ class Handler(BaseHTTPRequestHandler):
                     return
         self.json(HTTPStatus.NOT_FOUND, {"error": "资源未找到。"})
 
+    def send_ply(self, path, filename):
+        try:
+            if path.resolve(strict=True) != path:
+                raise OSError("Invalid saved model path")
+            stream = path.open("rb")
+            length = os.fstat(stream.fileno()).st_size
+        except (OSError, RuntimeError):
+            self.json(HTTPStatus.NOT_FOUND, {"error": "训练模型文件未找到。"})
+            return
+        with stream:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(length))
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            try:
+                shutil.copyfileobj(stream, self.wfile, 1024**2)
+            except (ConnectionError, TimeoutError):
+                pass
+
     def get_timeline(self, path):
         try:
             if path == "/api/timeline":
@@ -1032,6 +1249,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self.authorized_request(self.path):
             return
+        if self.path == "/api/photo-jobs":
+            self.post_photos()
+            return
         render_match = re.fullmatch(r"/api/jobs/([0-9a-f]{32})/render", self.path)
         if self.path not in ("/api/jobs", "/api/training") and render_match is None:
             self.json(HTTPStatus.NOT_FOUND, {"error": "资源未找到。"})
@@ -1046,7 +1266,7 @@ class Handler(BaseHTTPRequestHandler):
             unavailable = workbench.training_error()
             start = workbench.start_training
         else:
-            unavailable = None if workbench.executable else "未找到 COLMAP 可执行文件。"
+            unavailable = None
             start = workbench.start_reconstruction
         if unavailable:
             self.json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": unavailable})
@@ -1062,11 +1282,38 @@ class Handler(BaseHTTPRequestHandler):
         if render_match is not None:
             self.render_frame(render_match[1], payload)
             return
+        if self.path == "/api/jobs" and isinstance(payload, dict):
+            engine = payload.get("engine", "colmap")
+            unavailable = workbench.vggt_error() if engine == "vggt" else (
+                "未找到 COLMAP 可执行文件。" if engine == "colmap" and not workbench.executable else None
+            )
+            if unavailable:
+                self.json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": unavailable})
+                return
         try:
             start(payload)
         except RuntimeError as exc:
             self.json(HTTPStatus.CONFLICT, {"error": str(exc)})
         except (OSError, ValueError) as exc:
+            self.json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+        else:
+            self.json(HTTPStatus.ACCEPTED, workbench.status())
+
+    def post_photos(self):
+        if self.headers.get_content_type() != "application/octet-stream":
+            self.json(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, {"error": "请从工作台提交照片。"})
+            return
+        workbench = self.server.workbench
+        try:
+            upload = read_upload(self.rfile, int(self.headers.get("Content-Length", "0")))
+            unavailable = workbench.studio_training_error() or workbench.photo_engine_error(upload.engine)
+            if unavailable:
+                self.json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": unavailable})
+                return
+            workbench.start_photo_job(self.rfile, upload)
+        except RuntimeError as exc:
+            self.json(HTTPStatus.CONFLICT, {"error": str(exc)})
+        except (ImportError, OSError, ValueError) as exc:
             self.json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
         else:
             self.json(HTTPStatus.ACCEPTED, workbench.status())
@@ -1083,18 +1330,40 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self.json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
         else:
-            self.reply(HTTPStatus.OK, image, "image/jpeg")
+            try:
+                self.reply(HTTPStatus.OK, image, "image/jpeg")
+            except (ConnectionError, TimeoutError):
+                pass
 
     def log_message(self, format, *args):
         # Reconstruction output is captured in the workbench's own log.
         pass
 
 
+def modules_available(python, *modules):
+    if not python:
+        return False
+    if Path(python) == Path(sys.executable):
+        return all(importlib.util.find_spec(name) is not None for name in modules)
+    try:
+        command = "from importlib.util import find_spec; import sys; sys.exit(not all(find_spec(n) for n in sys.argv[1:]))"
+        result = subprocess.run([python, "-B", "-c", command, *modules], capture_output=True, timeout=8)
+        return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run the local COLMAP web workbench.")
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--data-root", type=Path, default=PHOTO_JOBS_ROOT)
+    parser.add_argument("--desktop", action="store_true", help="Exit when the desktop launcher closes stdin.")
+    parser.add_argument("--open", action="store_true", help="Open the studio in the default browser.")
     parser.add_argument("--lan", type=lan_interface, metavar="ADDRESS/PREFIX", help="Also listen on this private LAN interface with password authentication.")
     parser.add_argument("--colmap", help="Path to a compiled COLMAP executable.")
+    parser.add_argument("--vggt-python", help="Python interpreter for VGGT.")
+    parser.add_argument("--vggt-root", type=Path, default=VGGT_CACHE / f"vggt-{VGGT_REVISION}")
+    parser.add_argument("--vggt-weights", type=Path, default=VGGT_CACHE / "model.safetensors")
     parser.add_argument("--gs-python", help="Python interpreter for 3DGS.")
     parser.add_argument("--gs-root", type=Path, default=DEFAULT_GS_ROOT, help="3DGS source directory.")
     parser.add_argument("--restore-training", type=Path, metavar="PATH", help="Load the latest completed 3DGS model in this output directory.")
@@ -1107,12 +1376,17 @@ def main():
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGTERM, stop_server)
+    vggt_venv = VGGT_CACHE / "venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     gs_python = (
         shutil.which(os.path.expanduser(args.gs_python)) if args.gs_python
-        else shutil.which(str(WEB_ROOT / ".venv" / "bin" / "python")) or sys.executable
+        else shutil.which(str(WEB_ROOT / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")))
+        or (shutil.which(str(vggt_venv)) if os.name == "nt" else None) or sys.executable
     )
     if gs_python is not None:
         gs_python = os.path.abspath(gs_python)
+    vggt_python = shutil.which(os.path.expanduser(args.vggt_python or str(vggt_venv)))
+    if args.vggt_python and not vggt_python:
+        parser.error(f"VGGT Python executable not found: {args.vggt_python}")
     with ExitStack() as listeners:
         try:
             local = listeners.enter_context(ThreadingHTTPServer(("127.0.0.1", args.port), Handler))
@@ -1123,12 +1397,20 @@ def main():
         except (OSError, ValueError) as exc:
             parser.error(str(exc))
 
-        workbench = Workbench(executable, gs_python, args.gs_root.expanduser().resolve(), detect_gpus())
+        workbench = Workbench(
+            executable, gs_python, args.gs_root.expanduser().resolve(), detect_gpus(),
+            vggt_python=vggt_python, vggt_root=args.vggt_root.expanduser().resolve(),
+            vggt_weights=args.vggt_weights.expanduser().resolve(),
+            photo_jobs_root=args.data_root.expanduser().resolve(), desktop=args.desktop,
+        )
+        workbench.init_sample()
         if args.restore_training is not None:
             try:
                 workbench.restore_training(args.restore_training.expanduser().resolve())
             except (OSError, ValueError, RuntimeError) as exc:
                 parser.error(str(exc))
+        if args.restore_training is None:
+            workbench.restore_latest_photo_job()
         configure_listener(local, workbench, ("127.0.0.1", "localhost"))
         if args.lan is not None:
             configure_listener(lan, workbench, (address,), args.lan.network, authentication)
@@ -1136,9 +1418,18 @@ def main():
             listeners.callback(lan.shutdown)
             print(f"LAN: http://{address}:{lan.server_port}/ (user: colmap, password file: {LAN_PASSWORD_FILE})", flush=True)
 
-        print(f"COLMAP workbench: http://127.0.0.1:{local.server_port}/", flush=True)
+        address = f"http://127.0.0.1:{local.server_port}/"
+        print(f"COLMAP workbench: {address}", flush=True)
+        if args.open:
+            import webbrowser
+            threading.Thread(target=webbrowser.open, args=(address,), daemon=True).start()
         if executable is None:
             print("COLMAP executable not found. Start again with --colmap /path/to/colmap to run jobs.", flush=True)
+        if args.desktop:
+            def close_with_launcher():
+                sys.stdin.buffer.read()
+                local.shutdown()
+            threading.Thread(target=close_with_launcher, daemon=True).start()
         try:
             local.serve_forever()
         except KeyboardInterrupt:

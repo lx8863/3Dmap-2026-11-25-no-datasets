@@ -33,7 +33,7 @@
         <p>从多视角照片恢复三维结构，在本机 GPU 上训练 3D Gaussian Splatting。</p>
       </div>
       <nav class="mode-switch" aria-label="工作模式">
-        <button type="button" id="reconstruction-mode" data-mode="reconstruction" aria-pressed="true">COLMAP 重建</button>
+        <button type="button" id="reconstruction-mode" data-mode="reconstruction" aria-pressed="true">照片重建</button>
         <button type="button" id="training-mode" data-mode="training" aria-pressed="false">3DGS 训练</button>
         <button type="button" id="timeline-mode" data-mode="timeline" aria-pressed="false">前视时间轴</button>
       </nav>
@@ -77,6 +77,13 @@
           </div>
           <form id="reconstruction-form">
             <div class="field">
+              <label for="reconstruction-engine">重建引擎</label>
+              <select id="reconstruction-engine" name="engine">
+                <option value="colmap">COLMAP</option>
+                <option value="vggt">VGGT 少图重建（测试）</option>
+              </select>
+            </div>
+            <div class="field">
               <label for="image-path">图像目录</label>
               <div class="path-input">
                 <span class="folder-icon" aria-hidden="true"></span>
@@ -89,10 +96,10 @@
                 <span class="folder-icon" aria-hidden="true"></span>
                 <input id="workspace-path" name="workspacePath" placeholder="/data/scene/output" required spellcheck="false" autocomplete="off">
               </div>
-              <p class="field-note">输入本机目录的绝对路径。</p>
+              <p class="field-note" id="workspace-note">输入本机目录的绝对路径。</p>
             </div>
 
-            <div class="field-row">
+            <div class="field-row" data-colmap-field>
               <div class="field">
                 <label for="data-type">数据类型</label>
                 <select id="data-type" name="dataType">
@@ -111,7 +118,7 @@
                 </select>
               </div>
             </div>
-            <div class="field">
+            <div class="field" data-colmap-field>
               <label for="mapper">建图方式</label>
               <select id="mapper" name="mapper">
                 <option value="incremental">增量式 · Incremental</option>
@@ -120,7 +127,7 @@
               </select>
             </div>
 
-            <div class="switches">
+            <div class="switches" data-colmap-field>
               <label class="switch-row">
                 <span>使用 GPU</span>
                 <input type="checkbox" name="useGpu" id="use-gpu" role="switch">
@@ -207,6 +214,7 @@
             <li data-stage="sparse" data-state="waiting"><span class="step-marker" aria-hidden="true"></span><span>稀疏重建</span><span class="step-status">等待</span></li>
             <li data-stage="dense" data-state="skipped"><span class="step-marker" aria-hidden="true"></span><span>稠密重建</span><span class="step-status">已关闭</span></li>
           </ol>
+          <p id="vggt-progress" class="progress-detail" role="status" hidden></p>
         </section>
         <section class="card workflow" data-section="training" aria-labelledby="training-progress-title" hidden>
           <div class="card-heading workflow-heading">

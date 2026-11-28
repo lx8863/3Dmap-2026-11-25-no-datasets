@@ -1,8 +1,8 @@
 # 3Dmap
 
-COLMAP 与 3D Gaussian Splatting 本地工作台，归档日期：2026-11-25。
+3Dmap 是本地照片重建工作台。通过 VGGT 或 COLMAP 标定相机，再用 3D Gaussian Splatting 训练、预览并导出 PLY。
 
-本仓库导入自 `3Dmap-2026-11-25-no-datasets.zip`。原始数据集和点云文件不包含在仓库中；其余源码、工作台、训练配置与日志保留。点云由使用者在本地重建或训练生成。
+仓库从 2026-11-25 的归档发展而来。首页内置一个「庭院花簇」示例，模型和来源说明位于 `web/sample/`。导入照片生成的项目会保存在本机。
 
 ## 下载
 
@@ -20,17 +20,22 @@ cd 3Dmap-2026-11-25-no-datasets
 - `web/`：网页工作台和本地 Python 服务，使用说明见 [web/README.md](web/README.md)。
 - `colmap/`：COLMAP 源码。
 - `gaussian-splatting/gaussian-splatting/`：3D Gaussian Splatting 源码及依赖代码。
-- `outputs/`：归档包中的训练配置、相机参数与日志，已排除点云。
+- `outputs/`：原始归档的训练配置、相机参数和日志。
+- `packaging/`：Windows 便携版启动器和构建脚本。
 
 ## 启动工作台
 
-按 `web/README.md` 准备依赖和运行环境后，在仓库根目录运行：
+Windows 双击 `Start-3Dmap.cmd`。也可以在仓库根目录运行 `python -B web/serve.py --open`，进入照片多选、相机标定、3DGS 训练、渲染和 PLY 下载的工作台。环境配置见 [工作台说明](web/README.md)。
 
-```bash
-python3 -B web/serve.py
+## Windows 便携版
+
+在已按[工作台说明](web/README.md)配置 VGGT 和 3DGS 的 Windows 环境中，用 VGGT 虚拟环境运行打包脚本。
+
+```powershell
+web/.vggt/venv/Scripts/python.exe -B packaging/build_windows.py
 ```
 
-然后访问 <http://127.0.0.1:8765/>。归档中的环境路径、系统依赖和显卡配置可能需要按运行机器调整。
+发布目录为 `dist/3Dmap-Windows-x64/`。将整个目录复制到目标电脑，然后双击 `3Dmap.exe`。预编译 CUDA 扩展面向 RTX 50 系列。运行所需的驱动及操作说明随包提供。
 
 ## 许可
 

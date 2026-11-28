@@ -30,6 +30,7 @@
       else {
         clearTimeout(this.settleTimer);
         this.moving = false;
+        this.endDrag();
         this.abort?.abort();
       }
     }
@@ -72,30 +73,51 @@
       this.invalidateForMotion();
     }
 
+    endDrag() {
+      if (!this.drag) return;
+      const id = this.drag.id;
+      this.drag = null;
+      delete this.surface.dataset.dragging;
+      if (this.surface.hasPointerCapture(id)) this.surface.releasePointerCapture(id);
+    }
+
     bindControls() {
       const surface = this.surface;
       surface.addEventListener("pointerdown", (event) => {
-        if ((event.button !== 0 && event.button !== 2) || this.drag) return;
+        if (![0, 1, 2].includes(event.button) || this.drag) return;
         event.preventDefault();
         surface.focus({ preventScroll: true });
-        this.drag = { id: event.pointerId, x: event.clientX, y: event.clientY, pan: event.button === 2 };
-        surface.setPointerCapture(event.pointerId);
+        this.drag = {
+          id: event.pointerId, x: event.clientX, y: event.clientY,
+          orbit: event.button === 1, pan: event.button === 2,
+          buttonMask: [1, 4, 2][event.button],
+        };
+        if (event.pointerType !== "mouse") surface.setPointerCapture(event.pointerId);
         surface.dataset.dragging = "true";
       });
-      surface.addEventListener("pointermove", (event) => {
+      window.addEventListener("pointermove", (event) => {
         if (event.pointerId !== this.drag?.id) return;
-        this.move(event.clientX - this.drag.x, event.clientY - this.drag.y, this.panMode || this.drag.pan || event.shiftKey);
+        if (event.pointerType === "mouse" && !(event.buttons & this.drag.buttonMask)) {
+          this.endDrag();
+          return;
+        }
+        const pan = !this.drag.orbit && (this.panMode || this.drag.pan || event.shiftKey);
+        this.move(event.clientX - this.drag.x, event.clientY - this.drag.y, pan);
         this.drag.x = event.clientX;
         this.drag.y = event.clientY;
       });
       const finishDrag = (event) => {
-        if (this.drag?.id !== event.pointerId) return;
-        this.drag = null;
-        delete surface.dataset.dragging;
+        if (this.drag?.id === event.pointerId) this.endDrag();
       };
-      for (const event of ["pointerup", "pointercancel", "lostpointercapture"]) {
-        surface.addEventListener(event, finishDrag);
-      }
+      window.addEventListener("pointerup", finishDrag);
+      window.addEventListener("pointercancel", finishDrag);
+      window.addEventListener("blur", () => this.endDrag());
+      surface.addEventListener("lostpointercapture", finishDrag);
+      const cancelMiddleClick = (event) => {
+        if (event.button === 1) event.preventDefault();
+      };
+      surface.addEventListener("mousedown", cancelMiddleClick);
+      surface.addEventListener("auxclick", cancelMiddleClick);
       surface.addEventListener("contextmenu", (event) => event.preventDefault());
       surface.addEventListener("dragstart", (event) => event.preventDefault());
       surface.addEventListener("wheel", (event) => {

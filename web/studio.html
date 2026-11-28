@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>3Dmap · 照片转 3D</title>
+  <link rel="stylesheet" href="/studio.css">
+  <script defer src="/interactive-view.js"></script>
+  <script defer src="/studio.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="shell topbar-inner">
+      <a href="/" class="brand"><span class="brand-icon" aria-hidden="true"></span>3Dmap</a>
+      <nav aria-label="工作台导航">
+        <span id="connection" class="connection" data-state="pending">连接本地服务</span>
+        <a href="#sample" id="sample-nav" hidden>示例模型</a>
+        <a href="#about">产品介绍</a>
+        <a href="/workbench" id="advanced-nav" hidden>高级工作台</a>
+      </nav>
+    </div>
+  </header>
+  <main class="shell">
+    <div class="intro">
+      <h1>照片转成 3D 模型</h1>
+      <p>导入同一场景的多视角照片，自动标定相机、训练 3DGS 并预览结果。</p>
+    </div>
+    <div class="workspace">
+      <form id="create-form" class="panel">
+        <fieldset id="settings">
+          <legend>生成设置</legend>
+          <div class="section">
+            <h2 id="engine-label">标定方式</h2>
+            <div class="engine-picks" role="radiogroup" aria-labelledby="engine-label">
+              <label class="engine"><input type="radio" name="engine" value="vggt" checked>
+                <span><strong>VGGT</strong><small>适合少量照片</small></span></label>
+              <label class="engine"><input type="radio" name="engine" value="colmap">
+                <span><strong>COLMAP</strong><small>适合视角重叠的照片</small></span></label>
+            </div>
+          </div>
+          <div class="section">
+            <div class="row"><h2>照片</h2><span id="photo-count" class="counter">0 张</span></div>
+            <input id="photos" type="file" multiple accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp" hidden>
+            <button id="photo-picker" class="picker" type="button">
+              <span class="picker-icon" aria-hidden="true">+</span>
+              <span><strong id="pick-label">选择照片</strong><small>也可以把照片拖到这里</small></span>
+            </button>
+            <div id="photo-grid" class="photo-grid" aria-label="已选照片" hidden></div>
+            <p class="hint" id="photo-hint">选择 2–12 张有视角重叠的照片。</p>
+          </div>
+          <div class="section">
+            <label class="field-label" for="iterations">3DGS 训练步数</label>
+            <div class="iterations">
+              <input id="iterations" type="number" inputmode="numeric" min="1" max="30000" step="1" value="1000" required>
+              <span>步</span>
+            </div>
+            <div class="presets" aria-label="训练步数预设">
+              <button type="button" data-steps="1000" aria-pressed="true">快速 1,000</button>
+              <button type="button" data-steps="3000" aria-pressed="false">标准 3,000</button>
+              <button type="button" data-steps="7000" aria-pressed="false">精细 7,000</button>
+            </div>
+          </div>
+        </fieldset>
+        <button type="submit" class="primary" id="start" disabled>开始生成</button>
+        <p class="notice" id="notice" role="status" hidden></p>
+      </form>
+      <section class="panel" aria-labelledby="result-heading">
+        <div class="result-head row">
+          <div><h2 id="result-heading">渲染结果</h2><p id="result-detail" class="hint">训练完成后在这里查看模型。</p></div>
+          <a id="download" class="download" aria-disabled="true"><span aria-hidden="true">↓</span> 下载 PLY</a>
+        </div>
+        <div class="preview">
+          <div id="empty-preview" class="empty">
+            <div class="scene-icon" aria-hidden="true"></div>
+            <strong id="empty-title">等待生成</strong>
+            <p id="empty-detail">上传照片后，渲染结果将出现在这里。</p>
+          </div>
+          <img id="render" class="render" alt="3DGS 渲染结果" hidden>
+          <div id="free-view" class="free-view" tabindex="0" aria-label="按住滚轮拖动或使用方向键旋转模型" hidden>
+            <img id="free-image" alt="3DGS 自由视角" draggable="false" hidden>
+            <p id="free-status" role="status"></p>
+          </div>
+        </div>
+        <div id="render-controls" class="render-controls row" hidden>
+          <div class="segments">
+            <button type="button" id="show-render" aria-pressed="true">渲染</button>
+            <button type="button" id="show-original" aria-pressed="false">原照片</button>
+            <button type="button" id="show-free" aria-pressed="false" hidden>自由视角</button>
+          </div>
+          <div id="camera-controls" class="segments">
+            <button type="button" id="previous" aria-label="上一视角">←</button>
+            <span id="camera-index"></span>
+            <button type="button" id="next" aria-label="下一视角">→</button>
+          </div>
+        </div>
+        <p class="hint orbit-hint" id="orbit-hint" hidden>按住滚轮拖动旋转，滚动缩放，右键拖动平移。</p>
+        <div id="job-progress" class="job-progress" hidden>
+          <div class="row"><strong id="stage" role="status"></strong><span id="progress-label"></span></div>
+          <progress id="progress" aria-label="任务进度"></progress>
+        </div>
+        <details id="log-panel" hidden><summary>运行详情</summary><pre id="logs"></pre></details>
+      </section>
+    </div>
+    <section class="panel showcase" id="sample" aria-labelledby="sample-heading" hidden>
+      <div class="sample-description">
+        <h2 id="sample-heading">示例模型</h2>
+        <h3>庭院花簇</h3>
+        <p class="hint">从 4 张照片重建，经 VGGT 标定和 1,000 步 3DGS 训练生成。</p>
+        <div class="sample-buttons">
+          <button type="button" class="primary" id="sample-open" aria-pressed="false">体验自由视角</button>
+          <button type="button" class="download" id="sample-reset" hidden>重置视角</button>
+        </div>
+        <p class="hint" id="sample-tip">按住滚轮拖动旋转，滚动缩放，右键拖动平移。</p>
+      </div>
+      <div class="preview sample-preview">
+        <img id="sample-image" class="render" alt="庭院花簇示例的 3DGS 渲染结果">
+        <div id="sample-view" class="free-view" tabindex="0" aria-label="庭院花簇自由视角，按住滚轮拖动可旋转" hidden>
+          <img id="sample-frame" alt="庭院花簇自由视角" draggable="false" hidden>
+          <p id="sample-status" role="status"></p>
+        </div>
+      </div>
+    </section>
+    <section class="panel product-about" id="about" aria-labelledby="about-heading">
+      <h2 id="about-heading">关于 3Dmap</h2>
+      <p>3Dmap 用多角度照片重建实物和场景。导入照片后，VGGT 或 COLMAP 会估计拍摄位置与方向，3DGS 根据这些结果训练模型。你可以在本机旋转查看模型、对照原照片，并将高斯模型保存为 PLY。</p>
+    </section>
+  </main>
+</body>
+</html>
