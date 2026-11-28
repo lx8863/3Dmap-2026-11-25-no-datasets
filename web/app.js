@@ -33,6 +33,7 @@
   let focusedPoints = false;
   let panMode = false;
   let previewIsTraining = false;
+  let previewEngine = null;
   let gpuOptions = "";
   let copyTimeout;
 
@@ -75,7 +76,8 @@
     } else if (showImage) {
       $("model-detail-note").textContent = "按拍摄相机的位姿渲染";
     } else if (pointData) {
-      $("viewport-label-text").textContent = previewIsTraining ? "高斯中心采样" : "COLMAP · 稀疏点云";
+      $("viewport-label-text").textContent = previewIsTraining ? "高斯中心采样"
+        : previewEngine === "vggt" ? "VGGT · 点云" : "COLMAP · 稀疏点云";
       $("model-detail-note").textContent = `显示 ${numbers.format(viewer.pointCount)} 个点`;
     }
     if (!showImage) return;
@@ -114,6 +116,7 @@
     const fields = new FormData(form);
     if (form === reconstructionForm) {
       return {
+        engine: $("reconstruction-engine").value,
         imagePath: $("image-path").value.trim(),
         workspacePath: $("workspace-path").value.trim(),
         dataType: $("data-type").value,
@@ -139,6 +142,12 @@
 
   function renderCommand() {
     const options = formOptions(reconstructionForm);
+    const isVggt = options.engine === "vggt";
+    $("copy-command").hidden = isVggt || $("command-tab").getAttribute("aria-selected") !== "true";
+    if (isVggt) {
+      $("command-output").textContent = "选择照片目录和新工作区后，点击「开始 VGGT 重建」。";
+      return;
+    }
     const binary = service?.executable ? shellQuote(service.executable) : "colmap";
     const mapper = service?.colmapMappers?.length === 1 ? "" : ` --mapper ${options.mapper}`;
     $("command-output").textContent = [
@@ -159,7 +168,7 @@
       $(tab.getAttribute("aria-controls")).hidden = !isActive;
       if (focus && isActive) tab.focus();
     }
-    $("copy-command").hidden = name !== "command";
+    $("copy-command").hidden = name !== "command" || $("reconstruction-engine").value === "vggt";
   }
 
   function rememberView(anchor) {
@@ -224,7 +233,8 @@
       : "填写 5090 主机上包含 images/ 和 sparse/0/ 的实际目录。";
     $("training-image-field").hidden = !isColmap;
     $("training-image-path").required = isColmap;
-    $("use-last-reconstruction").hidden = !isColmap || !service?.lastReconstruction;
+    const previous = service?.lastReconstruction;
+    $("use-last-reconstruction").hidden = !previous || (!isColmap && previous.sourceType !== "dataset");
   }
 
   function setFormStatus(element, message, error = false) {
@@ -237,6 +247,7 @@
     const activeKind = service?.job?.state === "running" ? service.job.kind : null;
     const busy = submitting || !!activeKind;
     const canReconstruct = !!service?.available;
+    const isVggt = $("reconstruction-engine").value === "vggt";
     const colmapGpu = service?.colmapGpu !== false;
     const colmapDense = service?.colmapDense !== false;
     const requiresColmap = $("source-type").value === "colmap";
@@ -245,6 +256,10 @@
     for (const field of reconstructionForm.querySelectorAll("input, select")) field.disabled = activeKind === "reconstruction";
     for (const field of trainingForm.querySelectorAll("input, select")) field.disabled = activeKind === "training";
     gpuSelect.disabled = activeKind === "training" || !service?.gpus?.length;
+    for (const group of reconstructionForm.querySelectorAll("[data-colmap-field]")) group.hidden = isVggt;
+    $("workspace-note").textContent = isVggt
+      ? "使用尚未创建的输出目录。测试版支持 2–12 张照片。"
+      : "输入本机目录的绝对路径。";
     const mapper = $("mapper");
     for (const option of mapper.options) option.disabled = !!service?.colmapMappers && !service.colmapMappers.includes(option.value);
     if (mapper.selectedOptions[0]?.disabled) mapper.value = service.colmapMappers[0];
@@ -257,13 +272,15 @@
     }
     renderTrainingSource();
     $("use-last-reconstruction").disabled = activeKind === "training";
-    $("run-button").disabled = busy;
-    $("run-label").textContent = activeKind === "reconstruction" ? "正在重建" : canReconstruct ? "开始重建" : "查看重建命令";
+    $("run-button").disabled = busy || (isVggt && !service?.vggtAvailable);
+    $("run-label").textContent = activeKind === "reconstruction" ? "正在重建"
+      : isVggt ? "开始 VGGT 重建" : canReconstruct ? "开始重建" : "查看重建命令";
     $("train-button").disabled = busy || !canTrain;
     $("train-label").textContent = activeKind === "training" ? "正在训练" : "开始训练";
 
     let reconstructionNote = "";
     if (activeKind === "training") reconstructionNote = "GPU 训练进行中，可在「3DGS 训练」查看进度。";
+    else if (isVggt) reconstructionNote = service?.vggtError || (!service ? "启动本地服务后可使用 VGGT。" : "");
     else if (service && !canReconstruct) reconstructionNote = "本地服务尚未找到 COLMAP。";
     else if (canReconstruct && !colmapGpu) reconstructionNote = "当前 COLMAP 使用 CPU，3DGS 训练可单独使用 GPU。";
 
@@ -281,6 +298,14 @@
 
   function renderProgress() {
     const reconstruction = jobByKind.reconstruction;
+    const vggtProgress = reconstruction ? reconstruction.engine === "vggt" : $("reconstruction-engine").value === "vggt";
+    $("steps").hidden = vggtProgress;
+    $("vggt-progress").hidden = !vggtProgress;
+    if (vggtProgress) {
+      $("vggt-progress").textContent = reconstruction?.state === "succeeded" ? "VGGT 重建完成"
+        : reconstruction?.state === "failed" ? "VGGT 重建失败，请查看运行日志。"
+        : reconstruction?.state === "running" ? "VGGT 正在重建，可查看运行日志。" : "等待开始 VGGT 重建";
+    }
     const useDense = reconstruction?.dense ?? $("dense").checked;
     const current = steps.findIndex((step) => step.dataset.stage === reconstruction?.stage);
     steps.forEach((step, index) => {
@@ -348,6 +373,7 @@
     pointData = null;
     focusedPoints = false;
     previewIsTraining = job?.kind === "training";
+    previewEngine = job?.engine;
     setPanMode(false);
     renderPreviewMode();
     if (!url) {
@@ -402,7 +428,7 @@
     service = next;
     if (next.jobs) Object.assign(jobByKind, next.jobs);
     if (next.job) jobByKind[next.job.kind || "reconstruction"] = next.job;
-    linkState = next.available || next.trainingAvailable ? "online" : "missing";
+    linkState = next.available || next.trainingAvailable || next.vggtAvailable ? "online" : "missing";
     render();
   }
 
@@ -427,7 +453,9 @@
     const form = event.currentTarget;
     const isTraining = form === trainingForm;
     const notice = isTraining ? $("training-status") : $("form-status");
-    if (!isTraining && !service?.available) {
+    const payload = formOptions(form);
+    if (payload.engine === "vggt" && !service?.vggtAvailable) return;
+    if (payload.engine === "colmap" && !service?.available) {
       selectTab("command", true);
       $("command-panel").scrollIntoView({ block: "nearest" });
       return;
@@ -435,7 +463,6 @@
     if (isTraining && !service?.trainingAvailable) return;
     if (!form.reportValidity()) return;
 
-    const payload = formOptions(form);
     delete notice.dataset.rejected;
     submitting = true;
     statusRevision++;
@@ -488,6 +515,7 @@
   $("use-last-reconstruction").addEventListener("click", () => {
     const previous = service?.lastReconstruction;
     if (!previous) return;
+    $("source-type").value = previous.sourceType || "colmap";
     $("training-source").value = previous.workspacePath;
     $("training-image-path").value = previous.imagePath;
     delete $("training-status").dataset.rejected;

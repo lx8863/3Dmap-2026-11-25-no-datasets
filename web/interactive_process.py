@@ -3,10 +3,9 @@
 import base64
 import binascii
 import json
-import os
-import select
+from queue import Empty, Full, Queue
 import subprocess
-import time
+from threading import Thread
 
 
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
@@ -26,32 +25,39 @@ class InteractiveProcess:
             env=environment,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            bufsize=0,
             start_new_session=True,
         )
-        os.set_blocking(self.process.stdin.fileno(), False)
-        self.buffer = bytearray()
+        self.responses = Queue(maxsize=1)
+        Thread(target=self.read_lines, daemon=True).start()
+
+    def read_lines(self):
+        # Windows does not support select.poll() on anonymous subprocess pipes.
+        while True:
+            try:
+                line = self.process.stdout.readline(MAX_RESPONSE_BYTES + 1)
+                if not line:
+                    raise InteractiveRenderError("交互渲染器进程已退出。")
+                if len(line) > MAX_RESPONSE_BYTES:
+                    raise InteractiveRenderError("交互渲染器响应过大。")
+                if not line.endswith(b"\n"):
+                    raise InteractiveRenderError("交互渲染器响应不完整。")
+                response = line
+            except (InteractiveRenderError, OSError, ValueError) as exc:
+                response = InteractiveRenderError(str(exc))
+            try:
+                self.responses.put(response, timeout=RENDER_FRAME_TIMEOUT)
+            except Full:
+                return
+            if isinstance(response, InteractiveRenderError):
+                return
 
     def read_response(self, timeout):
-        deadline = time.monotonic() + timeout
-        descriptor = self.process.stdout.fileno()
-        poller = select.poll()
-        poller.register(descriptor, select.POLLIN)
-        while True:
-            newline = self.buffer.find(b"\n")
-            if newline >= 0:
-                line = self.buffer[:newline]
-                del self.buffer[:newline + 1]
-                break
-            remaining = deadline - time.monotonic()
-            if remaining <= 0 or not poller.poll(max(1, int(remaining * 1000))):
-                raise InteractiveRenderError("交互渲染器响应超时。")
-            chunk = os.read(descriptor, 65_536)
-            if not chunk:
-                raise InteractiveRenderError("交互渲染器进程已退出。")
-            self.buffer.extend(chunk)
-            if len(self.buffer) > MAX_RESPONSE_BYTES:
-                raise InteractiveRenderError("交互渲染器响应过大。")
+        try:
+            line = self.responses.get(timeout=timeout)
+        except Empty as exc:
+            raise InteractiveRenderError("交互渲染器响应超时。") from exc
+        if isinstance(line, InteractiveRenderError):
+            raise line
         try:
             response = json.loads(line)
         except (ValueError, RecursionError) as exc:
@@ -70,6 +76,7 @@ class InteractiveProcess:
         request = json.dumps(pose, separators=(",", ":")).encode("utf-8") + b"\n"
         if self.process.stdin.write(request) != len(request):
             raise InteractiveRenderError("交互渲染器未能接受请求。")
+        self.process.stdin.flush()
         encoded = self.read_response(RENDER_FRAME_TIMEOUT).get("jpeg")
         if not isinstance(encoded, str):
             raise InteractiveRenderError("交互渲染器未返回 JPEG。")
